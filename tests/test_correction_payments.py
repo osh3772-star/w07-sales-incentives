@@ -143,3 +143,18 @@ class CorrectionPaymentTests(unittest.TestCase):
         second = send_mock(self.db, TREASURY, self.iid, first)
         self.assertEqual([a["account"] for a in self.order()["attempts"]], [ACCOUNT, new_account])
         self.assertEqual(record_reply(self.db, TREASURY, "OK", second, AMOUNT, new_account, "success"), "matched")
+
+    def test_bank_contradicts_failure_after_reapproval_before_retry(self):
+        first = send_mock(self.db, TREASURY, self.iid)
+        self.merge()
+        record_reply(self.db, TREASURY, "FAIL", first, AMOUNT, ACCOUNT, "failure")
+        revised = submit_approval(self.db, STAFF, MONTH, "D-001", "실패 확인 후 재상신")
+        decide_approval(self.db, EXEC, revised, "approve", "임원 재승인")
+        self.assertEqual(record_reply(self.db, TREASURY, "LATE-SUCCESS", first, AMOUNT, ACCOUNT, "success"), "review")
+        self.assertEqual(self.order()["queue_state"], "bank_check")
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, self.iid, first)
+        record_reply(self.db, TREASURY, "CONFIRMED", first, AMOUNT, ACCOUNT, "success")
+        paid = self.order()
+        self.assertEqual((paid["state"], paid["post_review"], len(paid["attempts"])), ("completed", True, 1))
+        self.assertEqual(paid["effective_approval_id"], revised)

@@ -49,7 +49,7 @@
   {% endif %}
   {% for draft in drafts %}
   {% set returned = draft_input is defined and draft_input and draft_input.draft_id == draft.draft_id %}
-  <details class="draft-entry"{% if loop.first or returned %} open{% endif %}>
+  <details class="draft-entry" id="draft-{{ draft.draft_id }}"{% if loop.first or returned %} open{% endif %}>
     <summary>
       <span><strong>{{ names[draft.kind] }}</strong> <small>#{{ draft.draft_id }}{% if draft.rebate_id %} · {{ draft.rebate_id }}{% endif %}</small></span>
       <span class="status-tag">{{ '채택 완료' if draft.adopted_at else '검토 대기' }}</span>

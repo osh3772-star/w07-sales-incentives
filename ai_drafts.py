@@ -56,7 +56,7 @@ def _masker(db, cases):
 def _applicable_corrections(db, month, members, *, since=0):
     notices = []
     for row in db.execute(
-        """SELECT c.correction_id,c.agency_id,c.effective_date,c.after_json,
+        """SELECT c.correction_id,c.agency_id,c.effective_date,i.changed_json,
                   i.before_json AS previous_groups,i.after_json AS current_groups
            FROM agency_corrections c JOIN correction_impacts i
                 ON i.correction_id=c.correction_id AND i.period_ym=?
@@ -71,7 +71,7 @@ def _applicable_corrections(db, month, members, *, since=0):
         if impacted.intersection(members):
             notices.append({"correction_id": row["correction_id"], "agency_id": row["agency_id"],
                             "effective_date": row["effective_date"],
-                            "changed_fields": sorted(json.loads(row["after_json"]))})
+                            "changed_fields": sorted(json.loads(row["changed_json"]))})
     return notices
 
 

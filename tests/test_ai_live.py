@@ -9,11 +9,51 @@ from contextlib import closing
 from pathlib import Path
 
 from app import SOURCE_ROOT, create_app
+from ai_drafts import adopt_draft, generate_draft, list_drafts
+from approvals import decide_approval, submit_approval
+from corrections import apply_correction
+from store import open_db, receive_month, sync_sources
 from test_intake import FormToken, JUNE
+from workflow_security import USERS
 
 
 @unittest.skipUnless(os.environ.get("W07_TEST_LIVE_AI") == "1", "실제 모델 호출은 명시적으로 실행")
 class LiveDraftTest(unittest.TestCase):
+    def test_real_adopted_summary_and_new_proposal_after_registration_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "corrected-ai.sqlite3"
+            with closing(open_db(path)) as db:
+                sync_sources(db, SOURCE_ROOT)
+                receive_month(db, JUNE)
+                group = "D-001"
+                memo = generate_draft(db, USERS["staff"], JUNE, group, "summary")
+                original = list_drafts(db, JUNE, group)[0]
+                edit = original["original_text"] + "\n담당자 검토 기록."
+                adopt_draft(db, USERS["staff"], memo, edit)
+                decision = submit_approval(db, USERS["staff"], JUNE, group, "단독 그룹 확인")
+                decide_approval(db, USERS["lead"], decision, "approve", "팀 전결")
+                values = dict(db.execute(
+                    "SELECT representative_name,address FROM agencies WHERE agency_id='D-011'"
+                ).fetchone())
+                change = apply_correction(db, USERS["staff"], group, values, "2026-06-15",
+                                          "시험 대표자·주소 정정", "시험 변경확인서")
+                proposal = generate_draft(db, USERS["staff"], JUNE, group, "proposal")
+            with closing(open_db(path)) as db:
+                fresh, preserved = list_drafts(db, JUNE, group)
+                self.assertEqual((preserved["original_text"], preserved["adopted_text"], preserved["correction_ids"]),
+                                 (original["original_text"], edit, [change]))
+                self.assertEqual((fresh["draft_id"], fresh["review_required"]), (proposal, False))
+                packet = json.loads(fresh["evidence_json"])
+                self.assertEqual((packet["monthly_total_krw"], packet["new_amount_krw"], packet["reapproval_amount_krw"]),
+                                 (4_877_029, 3_888_097, 988_932))
+                self.assertFalse(packet["review_memos"])
+                self.assertIn("영업임원", fresh["original_text"])
+                for amount in (4_877_029, 3_888_097, 988_932):
+                    self.assertIn(str(amount), fresh["original_text"].replace(",", ""))
+                for item in (preserved, fresh):
+                    self.assertTrue(item["request_id"])
+                    print("LIVE correction", item["kind"], item["model"], item["request_id"])
+
     def test_real_web_generation_edit_adoption_and_reload(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "ai-live.sqlite3"

@@ -114,9 +114,10 @@ _ACCOUNT_RECHECKS_DUE = """
     SELECT t.task_id, t.instruction_id FROM correction_tasks t
     JOIN payment_instructions i USING(instruction_id)
     JOIN agency_corrections c USING(correction_id)
+    JOIN correction_impacts p ON p.correction_id=t.correction_id AND p.period_ym=t.period_ym
     LEFT JOIN payment_account_rechecks h USING(task_id)
     WHERE i.state IN ('held','ready','failed') AND t.reapproval_id IS NOT NULL
-      AND i.agency_id=c.agency_id AND json_type(c.after_json,'$.bank_account_no') IS NOT NULL
+      AND i.agency_id=c.agency_id AND json_type(p.changed_json,'$.bank_account_no') IS NOT NULL
       AND h.task_id IS NULL
 """
 
@@ -236,11 +237,12 @@ def _compare_reply(attempt, amount, account, result):
     return "matched", "completed", "금액·수취계좌 일치, 모의 은행 성공 확인."
 
 
-def _record_correction_followup(db, instruction_id, state, reply_id, actor):
+def _record_correction_followup(db, attempt, state, reply_id, actor):
     # Keep a resolved bank inquiry and its follow-up as separate auditable tasks.
     tasks = db.execute(
-        """SELECT * FROM correction_tasks WHERE instruction_id=? AND status='open'
-           AND kind IN ('bank_check','reapproval') ORDER BY task_id""", (instruction_id,),
+        """SELECT * FROM correction_tasks WHERE attempt_id=? AND kind IN ('bank_check','reapproval')
+           AND (status='open' OR (kind='reapproval' AND reapproval_id IS NOT NULL))
+           ORDER BY task_id""", (attempt["attempt_id"],),
     ).fetchall()
     if not tasks:
         return
@@ -253,15 +255,18 @@ def _record_correction_followup(db, instruction_id, state, reply_id, actor):
     group_id = next(line["group_id"] for line in month_overview(db, row["period_ym"])["rows"]
                     if line["rebate_id"] == row["rebate_id"])
     for task in moving:
+        if task["status"] == "open":
+            db.execute(
+                """UPDATE correction_tasks SET status='done', resolved_by=?, resolved_at=CURRENT_TIMESTAMP,
+                          resolution=? WHERE task_id=?""",
+                (actor.user_id, f"모의 은행 회신 {reply_id}", task["task_id"]),
+            )
         db.execute(
-            """UPDATE correction_tasks SET status='done', resolved_by=?, resolved_at=CURRENT_TIMESTAMP,
-                      resolution=? WHERE task_id=?""", (actor.user_id, f"모의 은행 회신 {reply_id}", task["task_id"]),
-        )
-        db.execute(
-            """INSERT INTO correction_tasks(correction_id,period_ym,group_id,rebate_id,instruction_id,kind)
-               VALUES(?,?,?,?,?,?)
+            """INSERT INTO correction_tasks(correction_id,period_ym,group_id,rebate_id,instruction_id,attempt_id,kind)
+               VALUES(?,?,?,?,?,?,?)
                ON CONFLICT(correction_id,rebate_id,kind) WHERE status='open' DO NOTHING""",
-            (task["correction_id"], task["period_ym"], group_id, task["rebate_id"], instruction_id, next_kind),
+            (task["correction_id"], task["period_ym"], group_id, task["rebate_id"],
+             attempt["instruction_id"], attempt["attempt_id"], next_kind),
         )
 
 
@@ -302,7 +307,7 @@ def record_reply(db, actor, reply_id, attempt_id, amount, account, result):
         if state:
             db.execute("UPDATE payment_instructions SET state=? WHERE instruction_id=?",
                        (state, attempt["instruction_id"]))
-            _record_correction_followup(db, attempt["instruction_id"], state, reply_id, actor)
+            _record_correction_followup(db, attempt, state, reply_id, actor)
         return outcome
 
 

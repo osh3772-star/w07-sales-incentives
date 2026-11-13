@@ -158,18 +158,22 @@ def current_memos(db, month, group_id):
 
 
 def list_approvals(db, month):
+    saved_versions = db.execute("SELECT * FROM approvals WHERE period_ym=? ORDER BY approval_id DESC",
+                                (month,)).fetchall()
+    if not saved_versions:
+        return []
     result = []
     seen = set()
     flags = correction_flags(db, month, "approval")
     _, membership = registered_groups(effective_agencies(db, month))
-    for saved in db.execute("SELECT * FROM approvals WHERE period_ym=? ORDER BY approval_id DESC", (month,)):
+    for saved in saved_versions:
         row = dict(saved)
         row["snapshot"] = json.loads(row["snapshot"])
         row["decision_snapshot"] = json.loads(row["decision_snapshot"]) if row["decision_snapshot"] else None
         row["correction_ids"] = flags.get(row["approval_id"], [])
         row["review_required"] = bool(row["correction_ids"])
-        row["visible_groups"] = sorted({row["group_id"], *(membership[a] for a in row["snapshot"]["members"]
-                                                           if a in membership)})
+        aliases = {membership[a] for a in row["snapshot"]["members"] if a in membership}
+        row["visible_groups"] = sorted(aliases | {row["group_id"]})
         targets = [line for line in row["snapshot"]["lines"]
                    if line["kind"] == "new" or line.get("reapproval_task_ids")]
         groups = set()

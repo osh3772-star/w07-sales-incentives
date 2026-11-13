@@ -1,6 +1,7 @@
 """Effective-dated registration changes and their settlement review obligations."""
 
 import json
+from dataclasses import dataclass
 from datetime import date
 
 from rules import IDENTITY_FIELDS, account_key, authority_for, effective_agencies, month_overview, registered_groups
@@ -19,7 +20,7 @@ CREATE TABLE IF NOT EXISTS agency_corrections (
 CREATE INDEX IF NOT EXISTS correction_by_date ON agency_corrections(effective_date,correction_id);
 CREATE TABLE IF NOT EXISTS correction_impacts (
     correction_id INTEGER NOT NULL REFERENCES agency_corrections, period_ym TEXT NOT NULL,
-    before_json TEXT NOT NULL, after_json TEXT NOT NULL,
+    before_json TEXT NOT NULL, after_json TEXT NOT NULL, changed_json TEXT NOT NULL,
     PRIMARY KEY(correction_id,period_ym)
 );
 CREATE TABLE IF NOT EXISTS correction_flags (
@@ -32,7 +33,8 @@ CREATE INDEX IF NOT EXISTS correction_target ON correction_flags(target_kind,tar
 CREATE TABLE IF NOT EXISTS correction_tasks (
     task_id INTEGER PRIMARY KEY, correction_id INTEGER NOT NULL REFERENCES agency_corrections,
     period_ym TEXT NOT NULL, group_id TEXT NOT NULL, rebate_id TEXT NOT NULL REFERENCES rebates,
-    instruction_id INTEGER REFERENCES payment_instructions, kind TEXT NOT NULL
+    instruction_id INTEGER REFERENCES payment_instructions, attempt_id TEXT REFERENCES mock_payment_attempts,
+    kind TEXT NOT NULL
         CHECK(kind IN ('reapproval','bank_check','post_review')),
     status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -61,26 +63,33 @@ def agency_versions(db):
     ))
 
 
+@dataclass
+class _MonthState:
+    values: dict
+    groups: dict
+    membership: dict
+    overview: dict
+
+
 def _registered_state(db, month, agency_id):
     master = effective_agencies(db, month)
     groups, membership = registered_groups(master)
     agency = next(row for row in master if row["agency_id"] == agency_id)
-    return {field: agency[field] for field in IDENTITY_FIELDS}, groups, membership, month_overview(db, month)
+    return _MonthState({field: agency[field] for field in IDENTITY_FIELDS}, groups, membership, month_overview(db, month))
 
 
 def _summaries(state, affected_ids):
-    _, groups, membership, overview = state
-    amounts = {g["group_id"]: g for g in overview["groups"]}
+    amounts = {g["group_id"]: g for g in state.overview["groups"]}
+    applied_groups = {r["group_id"] for r in state.overview["rows"]
+                      if r["bucket"] in ("paid_amount", "approved_amount", "review_amount")}
     result = []
-    for group_id in sorted({membership[agency_id] for agency_id in affected_ids}):
-        group = groups[group_id]
+    for group_id in sorted({state.membership[agency_id] for agency_id in affected_ids}):
+        group = state.groups[group_id]
         # Include groups without eligible obligations so splits and merges remain explainable.
         amount = amounts.get(group_id, {})
         total = amount.get("total", 0)
         # Projections can include not-yet-received lines. Snapshot the authority for the applied total.
-        has_applied = any(r["group_id"] == group_id and r["bucket"] in ("paid_amount","approved_amount","review_amount")
-                          for r in overview["rows"])
-        result.append(dict(group, total=total, authority=authority_for(total) if has_applied else "—",
+        result.append(dict(group, total=total, authority=authority_for(total) if group_id in applied_groups else "—",
                            projected_total=amount.get("projected_total", 0)))
     return result
 
@@ -90,14 +99,15 @@ def _flag(db, change_id, month, kind, target_id):
 
 
 def _record_month(db, change_id, month, agency_id, before, after):
-    if before[0] == after[0]:
+    changed = {key: value for key, value in after.values.items() if value != before.values[key]}
+    if not changed:
         return
-    old_group = before[1][before[2][agency_id]]
-    new_group = after[1][after[2][agency_id]]
+    old_group = before.groups[before.membership[agency_id]]
+    new_group = after.groups[after.membership[agency_id]]
     affected = set(old_group["members"]) | set(new_group["members"])
     old_groups, new_groups = _summaries(before, affected), _summaries(after, affected)
-    db.execute("INSERT INTO correction_impacts VALUES(?,?,?,?)",
-               (change_id, month, _json(old_groups), _json(new_groups)))
+    db.execute("INSERT INTO correction_impacts VALUES(?,?,?,?,?)",
+               (change_id, month, _json(old_groups), _json(new_groups), _json(changed)))
     for approval in db.execute("SELECT approval_id,status,snapshot FROM approvals WHERE period_ym=?", (month,)):
         if not affected.intersection(json.loads(approval["snapshot"])["members"]):
             continue
@@ -105,7 +115,6 @@ def _record_month(db, change_id, month, agency_id, before, after):
         if approval["status"] == "승인 대기":
             db.execute("UPDATE approvals SET status='정정 재검토' WHERE approval_id=?", (approval["approval_id"],))
 
-    new_rows = {row["rebate_id"]: row for row in after[3]["rows"]}
     for draft in db.execute("SELECT draft_id,evidence_json FROM ai_drafts WHERE period_ym=?", (month,)):
         basis = json.loads(draft["evidence_json"])
         # Even an unchanged edge can now require a new explanation: the model
@@ -114,10 +123,12 @@ def _record_month(db, change_id, month, agency_id, before, after):
             _flag(db, change_id, month, "draft", draft["draft_id"])
 
     orders = {r["rebate_id"]: r for r in db.execute(
-        """SELECT i.* FROM payment_instructions i JOIN rebates r USING(rebate_id) WHERE r.period_ym=?""",
+        """SELECT i.*, (SELECT attempt_id FROM mock_payment_attempts a WHERE a.instruction_id=i.instruction_id
+                        ORDER BY sequence_no DESC LIMIT 1) AS attempt_id
+           FROM payment_instructions i JOIN rebates r USING(rebate_id) WHERE r.period_ym=?""",
         (month,),
     )}
-    for row in new_rows.values():
+    for row in after.overview["rows"]:
         if row["agency_id"] not in affected:
             continue
         order = orders.get(row["rebate_id"])
@@ -136,9 +147,10 @@ def _record_month(db, change_id, month, agency_id, before, after):
         else:
             continue
         db.execute(
-            """INSERT INTO correction_tasks(correction_id,period_ym,group_id,rebate_id,instruction_id,kind)
-               VALUES(?,?,?,?,?,?)""",
-            (change_id, month, row["group_id"], row["rebate_id"], order["instruction_id"] if order else None, kind),
+            """INSERT INTO correction_tasks(correction_id,period_ym,group_id,rebate_id,instruction_id,attempt_id,kind)
+               VALUES(?,?,?,?,?,?,?)""",
+            (change_id, month, row["group_id"], row["rebate_id"], order["instruction_id"] if order else None,
+             order["attempt_id"] if order else None, kind),
         )
 
 
@@ -213,18 +225,23 @@ def list_corrections(db, month, group=None):
             "SELECT * FROM correction_impacts WHERE correction_id=? ORDER BY period_ym", (row["correction_id"],)
         )
         record["impacts"] = [
-            {"period_ym": i["period_ym"], "before": json.loads(i["before_json"]), "after": json.loads(i["after_json"])}
+            {"period_ym": i["period_ym"], "before": json.loads(i["before_json"]), "after": json.loads(i["after_json"]),
+             "changed_fields": sorted(json.loads(i["changed_json"]))}
             for i in impacts
         ]
         participates = any(i["period_ym"] == month and any(g["group_id"] == group for g in i["before"] + i["after"])
                            for i in record["impacts"])
         if not group or row["agency_id"] in members or participates:
             record["flags"] = [dict(flag) for flag in db.execute(
-                """SELECT target_kind,target_id,period_ym FROM correction_flags WHERE correction_id=?
-                   ORDER BY period_ym,target_kind,target_id""", (row["correction_id"],)
+                """SELECT f.target_kind,f.target_id,f.period_ym,COALESCE(a.group_id,d.group_id) AS group_id,
+                          d.kind AS draft_kind
+                   FROM correction_flags f
+                   LEFT JOIN approvals a ON f.target_kind='approval' AND a.approval_id=f.target_id
+                   LEFT JOIN ai_drafts d ON f.target_kind='draft' AND d.draft_id=f.target_id
+                   WHERE f.correction_id=? ORDER BY f.period_ym,f.target_kind,f.target_id""", (row["correction_id"],)
             )]
             record["tasks"] = [dict(task) for task in db.execute(
-                """SELECT task_id,kind,status,period_ym,group_id,rebate_id,instruction_id,reapproval_id
+                """SELECT task_id,kind,status,period_ym,group_id,rebate_id,instruction_id,attempt_id,reapproval_id
                    FROM correction_tasks WHERE correction_id=? ORDER BY period_ym,task_id""", (row["correction_id"],)
             )]
             items.append(record)

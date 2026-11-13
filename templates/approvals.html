@@ -57,6 +57,9 @@
       <summary>결재 당시 근거 · 정산 명세 <i class="chevron"></i></summary>
       <p class="identifiers">{{ basis.members|join(' · ') }}</p>
       {% for edge in basis.edges %}<p>{{ edge.left }} ↔ {{ edge.right }} · {{ edge['keys']|join(' · ') }} 일치</p>{% endfor %}
+      {% if basis.master %}<details class="record-detail"><summary>당시 대리점 등록정보 <i class="chevron"></i></summary>
+        {% for agency in basis.master %}<p>{{ agency.agency_id }} · {{ agency.representative_name }} · {{ agency.address }} · 등록계좌 끝자리 {{ agency.bank_account_no[-4:] }}</p>{% endfor %}
+      </details>{% endif %}
       <div class="table-wrap" tabindex="0" role="region" aria-label="결재 명세">
         <table class="compact-table"><thead><tr><th>대리점</th><th>정산건</th><th>포함 사유</th><th class="numeric">금액</th></tr></thead><tbody>
           {% for line in basis.lines %}<tr><td>{{ line.agency_id }}</td><td>{{ line.rebate_id }}</td><td>{{ '정정 후 재승인' if line.reapproval_task_ids else {'new':'이번 승인','paid':'기지급','approved':'승인 후 미집행'}.get(line.kind, line.kind) }}</td><td class="numeric">{{ money(line.amount) }}원</td></tr>{% endfor %}

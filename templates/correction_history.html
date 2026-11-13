@@ -5,12 +5,12 @@
   <details class="record-detail">
     <summary>{{ agency.agency_id }} · {{ agency.agency_name }} 등록정보{% if team %} 확인·정정{% endif %} <i class="chevron"></i></summary>
     <dl class="log"><dt>{{ month }} 월말 기준</dt>
-      <dd>{{ agency.representative_name }} · {{ agency.address }} · 등록계좌 끝자리 {{ agency.bank_account_no[-4:] }}</dd>
+      <dd>{{ agency.representative_name }} · {{ agency.address }} · {{ '등록계좌 끝자리 ' ~ agency.bank_account_no[-4:] if agency.bank_account_no and agency.bank_account_no != 'NONE' else '등록계좌 미확인' }}</dd>
     </dl>
     {% if team %}<form action="/cases/correct" method="post" class="form-stack">
       {{ fields() }}<input name="agency_id" type="hidden" value="{{ agency.agency_id }}">
       <input name="expected_version" type="hidden" value="{{ agency_versions[agency.agency_id] }}">
-      <p class="item-meta">바뀐 항목만 입력하세요. 적용일이 속한 귀속월부터 월말 기준으로 그룹과 누계를 다시 계산합니다.</p>
+      <p class="item-meta">바뀐 항목만 입력하세요. 기존 값을 미확인으로 정정하려면 NONE을 입력하세요. 적용일이 속한 귀속월부터 월말 기준으로 그룹과 누계를 다시 계산합니다.</p>
       {% for key, label in key_names.items() %}<label>변경할 {{ label }}<input name="{{ key }}"{% if key == 'bank_account_no' %} placeholder="은행명과 계좌번호"{% endif %}></label>{% endfor %}
       <div class="input-pair"><label>적용일<input type="date" name="effective_date" required></label>
         <label>정정 증빙<input name="evidence" required placeholder="문서명 또는 참조번호"></label></div>
@@ -37,7 +37,7 @@
       </div>
     </details>{% else %}<p class="item-meta">현재 적재된 정산월에 반영된 변경이 없습니다.</p>{% endfor %}
     {% for flag in record.flags if flag.period_ym == month %}
-      <p class="item-meta">{% if flag.target_kind == 'approval' %}<a href="{{ url_for('approvals',month=month,group=selected_group,_anchor='approval-' ~ flag.target_id) }}">결재 #{{ flag.target_id }}</a>{% else %}AI 초안 #{{ flag.target_id }}{% endif %} · 당시 근거 재검토 필요</p>
+      <p class="item-meta">{% if flag.target_kind == 'approval' %}<a href="{{ url_for('approvals',month=month,group=flag.group_id,_anchor='approval-' ~ flag.target_id) }}">결재 #{{ flag.target_id }}</a>{% else %}<a href="{{ url_for('approvals' if flag.draft_kind == 'proposal' else 'cases',month=month,group=flag.group_id,_anchor='draft-' ~ flag.target_id) }}">AI 초안 #{{ flag.target_id }}</a>{% endif %} · 당시 근거 재검토 필요</p>
     {% endfor %}
     {% for task in record.tasks if task.period_ym == month %}
       <p class="item-meta">작업 #{{ task.task_id }} · {{ task.rebate_id }}{% if task.instruction_id %} · 지급지시 #{{ task.instruction_id }}{% endif %} · {{ {'reapproval':'재승인','bank_check':'은행 결과 확인','post_review':'사후 검토'}[task.kind] }} {{ '완료' if task.status == 'done' else '대기' }}</p>
