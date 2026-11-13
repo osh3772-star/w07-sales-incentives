@@ -1,0 +1,143 @@
+{% extends "work_base.html" %}
+{% set title = '월 정산 접수' %}
+{% set section = 'index' %}
+{% from 'work_forms.html' import money, period, feedback_box, links with context %}
+{% block scripts %}<script defer src="{{ url_for('static', filename='intake.js') }}"></script>{% endblock %}
+{% block body %}
+{% macro path_tag(authority) -%}
+  {% if authority == '영업임원' %}<span class="tag executive">영업임원</span>
+  {% elif authority == '영업지원팀' %}<span class="tag team">영업지원팀</span>
+  {% else %}<span class="muted">—</span>{% endif %}
+{%- endmacro %}
+{% macro breakdown(group) -%}
+  <dl class="breakdown">
+    {% for label, value in [('기지급', group.paid_amount), ('승인 후 미집행', group.approved_amount), ('접수 완료 심사액', group.review_amount), ('접수 대기액', group.pending_amount)] %}
+    <div><dt>{{ label }}</dt><dd>{{ money(value) }}원</dd></div>
+    {% endfor %}
+  </dl>
+{%- endmacro %}
+  <section class="intro" aria-labelledby="page-title">
+    <div>
+      <h1 id="page-title">월 정산 접수</h1>
+      <p>귀속월별 장려금을 확인하고, 미지급 건을 심사 대상으로 접수합니다.</p>
+    </div>
+    <div class="actions">
+      {% if months %}
+      <form method="get" action="{{ url_for('index') }}" class="month-form">
+        <label class="month-select"><span class="cal-icon" aria-hidden="true"></span>
+          <span class="sr-only">정산 귀속월</span>
+          <select name="month" id="month-select">
+            {% for item in months|reverse %}<option value="{{ item }}"{% if item == month %} selected{% endif %}>{{ period(item) }}</option>{% endfor %}
+          </select>
+        </label>
+        <noscript><button class="secondary" type="submit">조회</button></noscript>
+      </form>
+      {% if overview and actor.role in ('staff','lead') %}
+      <form method="post" action="/intake" id="receive-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="month" value="{{ month }}">
+        <button type="submit" class="primary">
+          <span class="tray-icon" aria-hidden="true">↓</span>
+          {% if overview.stats.received_count and not overview.stats.pending_count %}다시 접수{% else %}월 정산 접수{% endif %}
+        </button>
+      </form>
+      {% endif %}
+      {% endif %}
+    </div>
+  </section>
+  {{ feedback_box() }}
+  {% if overview %}
+  {% set stats = overview.stats %}
+  <section class="summary" aria-label="{{ period(month) }} 정산 요약">
+    <article class="metric">
+      <h2>미지급 장려금</h2>
+      <p class="metric-value">{{ money(stats.unpaid_amount) }}<small>원</small></p>
+      <p class="metric-detail">{{ period(month) }} 적격 미지급 원장 합계</p>
+    </article>
+    <article class="metric">
+      <h2>미지급 정산건</h2>
+      <p class="metric-value">{{ stats.unpaid_count }}<small>건</small></p>
+      <p class="metric-detail">접수 완료 <strong>{{ stats.received_count }}건</strong><span class="bullet">·</span>접수 대기 <strong>{{ stats.pending_count }}건</strong></p>
+    </article>
+    <article class="metric">
+      <h2>영업임원 승인 예상</h2>
+      <p class="metric-value{% if stats.executive_group_count %} accent{% endif %}">{{ stats.executive_group_count }}<small>그룹</small></p>
+      <p class="metric-detail">전체 {{ stats.group_count }}그룹 중 월 한도 200만원 초과</p>
+    </article>
+  </section>
+  {% for group in overview.groups if group.members|length > 1 %}
+  <details class="group-feature">
+    <summary>
+      <span class="feature-icon" aria-hidden="true"><span></span><span></span><span></span></span>
+      <span class="feature-main"><span class="feature-heading">관련자 합산 그룹</span><span class="identifiers">{{ group.members|join(' · ') }}</span></span>
+      <span class="feature-total"><span>{% if group.pending_amount %}접수 후 예상 누계{% else %}그룹 월 누계{% endif %}</span><strong>{{ money(group.projected_total) }}<small>원</small></strong></span>
+      {{ path_tag(group.authority) }}
+      <span class="feature-toggle">판정 근거 <i class="chevron"></i></span>
+    </summary>
+    <div class="feature-content">
+      <div><h3>직접 연결 근거</h3>
+      <ul class="edges">{% for edge in group.edges %}<li><b>{{ edge.left }} ↔ {{ edge.right }}</b> {{ edge['keys']|join(' · ') }} 일치</li>{% endfor %}</ul>{{ links(group.group_id) }}</div>
+      <div><h3>월 누계 구성</h3>{{ breakdown(group) }}
+      <p class="applied">현재 반영된 누계 <strong>{{ money(group.total) }}원</strong></p></div>
+    </div>
+  </details>
+  {% endfor %}
+  {% if overview.issues %}
+  <details class="issues">
+    <summary>원본 확인 필요 {{ stats.issue_count }}건 <i class="chevron"></i></summary>
+    <ul>{% for issue in overview.issues %}<li><strong>{{ issue.rebate_id }}</strong> {{ issue.reason }}</li>{% endfor %}</ul>
+  </details>
+  {% endif %}
+  <section class="ledger" aria-labelledby="ledger-title">
+    <div class="ledger-header">
+      <div class="ledger-title"><h2 id="ledger-title">정산 내역</h2><span class="count">{{ stats.source_count }}건</span></div>
+      <label class="search js-only"><span class="search-icon" aria-hidden="true"></span><input type="search" id="ledger-search" aria-label="대리점 또는 정산 ID 검색" placeholder="대리점명, 대리점·정산 ID 검색"></label>
+    </div>
+    <div class="filter-line js-only">
+      <div class="filters" role="group" aria-label="정산 내역 필터">
+        <button type="button" class="filter" data-filter="all" aria-pressed="true">전체</button>
+        <button type="button" class="filter" data-filter="executive" aria-pressed="false">영업임원 경로</button>
+        <button type="button" class="filter" data-filter="check" aria-pressed="false">확인 필요</button>
+      </div>
+      <span class="filter-note">금액 단위 · 원</span>
+    </div>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="대리점 정산 내역">
+      <table>
+        <thead><tr><th scope="col">대리점</th><th scope="col">정산 ID</th><th scope="col" class="numeric">장려금</th><th scope="col" class="numeric">{% if stats.pending_count %}예상 그룹 월 누계{% else %}그룹 월 누계{% endif %}</th><th scope="col">예상 승인권자</th><th scope="col">정산 상태</th><th scope="col"><span class="sr-only">상세</span></th></tr></thead>
+        {% for row in overview.rows %}
+        {% set group = overview.groups|selectattr('group_id', 'equalto', row.group_id)|first %}
+        <tbody class="record" data-search="{{ row.agency_id }} {{ row.agency_name }} {{ row.rebate_id }}" data-executive="{{ '1' if row.authority == '영업임원' else '0' }}" data-check="{{ '1' if row.needs_check else '0' }}">
+          <tr>
+            <th scope="row"><span class="agency-name">{{ row.agency_name }}</span><small class="agency-id">{{ row.agency_id }}</small></th>
+            <td class="code">{{ row.rebate_id }}</td><td class="numeric number">{{ money(row.amount) }}</td>
+            <td class="numeric number">{{ money(row.group_total) }}</td><td>{{ path_tag(row.authority) }}</td>
+            <td><span class="state{% if row.state == '접수 완료' %} received{% endif %}">{{ row.state }}</span>{% if row.needs_check and row.state != '확인 필요' %}<span class="check-note">확인 필요</span>{% endif %}</td>
+            <td class="detail-cell"><button type="button" class="row-toggle js-only" aria-expanded="false" aria-controls="line-{{ loop.index }}" aria-label="{{ row.agency_id }} {{ row.rebate_id }} 상세"><i class="chevron"></i></button></td>
+          </tr>
+          <tr class="row-info" id="line-{{ loop.index }}" hidden><td colspan="7">
+            <div class="row-panel">
+              <section><h3>접수 근거</h3><p>원본 상태 <b>{{ row.source_status }}</b></p>
+              {% if row.intake_at %}<p>접수 시각 <b>{{ row.intake_at }}</b></p>{% endif %}
+              {% for note in row.notes %}<p class="evidence-note">{{ note }}</p>{% endfor %}</section>
+              {% if group %}
+              <section><h3>관련자 그룹</h3><p class="identifiers">{{ group.members|join(' · ') }}</p>
+              {% for edge in group.edges %}<p>{{ edge.left }} ↔ {{ edge.right }} · {{ edge['keys']|join(' · ') }} 일치</p>{% endfor %}
+              {% if group.members|length == 1 %}<p>직접 연결된 대리점이 없는 단독 그룹</p>{% endif %}{{ links(group.group_id) }}</section>
+              <section><h3>월 누계 구성</h3>{{ breakdown(group) }}<p class="applied">현재 반영된 누계 <strong>{{ money(group.total) }}원</strong></p></section>
+              {% endif %}
+            </div>
+          </td></tr>
+        </tbody>
+        {% endfor %}
+      </table>
+    </div>
+    <p class="empty-results" id="empty-results"{% if overview.rows %} hidden{% endif %}>{% if overview.rows %}조건에 맞는 정산건이 없습니다.{% else %}이 달의 정산 내역이 없습니다.{% endif %}</p>
+    <div class="pagination js-only">
+      <span id="result-range" aria-live="polite"></span>
+      <div><button type="button" id="previous" aria-label="이전 페이지"><i class="chevron left"></i></button><span id="page-position"></span><button type="button" id="next" aria-label="다음 페이지"><i class="chevron right"></i></button></div>
+    </div>
+  </section>
+  {% elif not error %}
+  <p class="empty-results">조회할 정산월이 없습니다.</p>
+  {% endif %}
+{% endblock %}

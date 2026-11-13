@@ -1,0 +1,45 @@
+{% macro money(value) -%}{{ '{:,}'.format(value) }}{%- endmacro %}
+{% macro period(value) -%}{{ value[:4] }}년 {{ value[5:]|int }}월{%- endmacro %}
+{% macro fields() -%}
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="month" value="{{ month or '' }}">
+  {% if selected_group %}<input type="hidden" name="group" value="{{ selected_group }}">{% endif %}
+{%- endmacro %}
+{% macro feedback_box() -%}
+  {% if feedback %}<div class="notice success" role="status">{{ feedback }}</div>{% endif %}
+  {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+{%- endmacro %}
+{% macro selector(endpoint, all_groups=false) -%}
+<form method="get" action="{{ url_for(endpoint) }}" class="work-selector">
+  <label>귀속월<select name="month">
+    {% for item in months|reverse %}<option value="{{ item }}"{% if item == month %} selected{% endif %}>{{ period(item) }}</option>{% endfor %}
+  </select></label>
+  <label>관련자 그룹<select name="group">
+    {% if all_groups %}<option value="">전체 그룹</option>{% endif %}
+    {% if overview %}{% for g in overview.groups %}
+      {% set names = overview.rows|selectattr('group_id','equalto',g.group_id)|list %}
+      <option value="{{ g.group_id }}"{% if g.group_id == selected_group %} selected{% endif %}>{{ g.members|join(' · ') }}{% if g.members|length == 1 and names %} · {{ names[0].agency_name }}{% endif %}</option>
+    {% endfor %}{% endif %}
+  </select></label>
+  <button type="submit" class="secondary">조회</button>
+</form>
+{%- endmacro %}
+{% macro role_label(user_id) -%}
+  {% set person = users|selectattr('user_id','equalto',user_id)|first %}
+  {{ person.label if person else (user_id or '—') }}
+{%- endmacro %}
+{% macro time(value) -%}
+  {% if value %}<time datetime="{{ value }}">{{ value[:19]|replace('T',' ') }} UTC</time>{% endif %}
+{%- endmacro %}
+{% macro amount_pair(total, requested) -%}
+<dl class="amount-pair">
+  <div><dt>그룹 월 누계</dt><dd>{{ money(total) }}<small>원</small></dd></div>
+  <div><dt>이번 승인 요청액</dt><dd>{{ money(requested) }}<small>원</small></dd></div>
+</dl>
+{%- endmacro %}
+{% macro links(gid) -%}
+<div class="work-links">
+  <a href="{{ url_for('cases', month=month, group=gid) }}">관련자·소명</a>
+  <a href="{{ url_for('approvals', month=month, group=gid) }}">그룹 결재</a>
+</div>
+{%- endmacro %}

@@ -1,0 +1,85 @@
+{% extends "work_base.html" %}
+{% set section = 'approvals' %}
+{% set title = '그룹 결재' %}
+{% from 'work_forms.html' import money, selector, fields, feedback_box, role_label, time, amount_pair with context %}
+{% block body %}
+<section class="intro"><div><h1>그룹 결재</h1><p>월 누계로 승인권자를 확인하고 이번에 지급할 신규 정산건을 결정합니다.</p></div></section>
+{{ feedback_box() }}
+{{ selector(section) }}
+{% set chosen = overview.groups|selectattr('group_id','equalto',selected_group)|first if overview else none %}
+{% if chosen %}
+{% set team = actor.role in ('staff','lead') %}
+{% set history = approvals|selectattr('group_id','equalto',selected_group)|list %}
+{% set pending = history|selectattr('status','equalto','승인 대기')|first %}
+{% set supplements = history|selectattr('status','equalto','보완 요청')|selectattr('can_resubmit')|list %}
+{% set grouped_rows = overview.rows|selectattr('group_id','equalto',selected_group)|list %}
+{% set included_ids = grouped_rows|selectattr('bucket','in',('review_amount','paid_amount','approved_amount'))|map(attribute='rebate_id')|list %}
+{% set blockers = cases|selectattr('rebate_id','in',included_ids)|selectattr('required')|rejectattr('status','equalto','해소')|list %}
+{% set review = grouped_rows|selectattr('bucket','equalto','review_amount')|list %}
+{% set unreceived = grouped_rows|selectattr('bucket','equalto','pending_amount')|list %}
+<section class="work-card">
+  <div class="work-heading"><div><h2>현재 심사 대상</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
+    <a class="work-link" href="{{ url_for('cases', month=month, group=selected_group) }}">관련자·소명 보기 →</a></div>
+  {{ amount_pair(chosen.total, chosen.review_amount) }}
+  <div class="fact-strip"><span>기지급 <strong>{{ money(chosen.paid_amount) }}원</strong></span><span>승인 후 미집행 <strong>{{ money(chosen.approved_amount) }}원</strong></span><span>접수 대기 <strong>{{ money(chosen.pending_amount) }}원</strong></span></div>
+  {% if blockers %}<p class="attention">필수 소명 {{ blockers|length }}건의 해소가 필요합니다. {% for case in blockers %}#{{ case.case_id }} {{ case.status }}{% if not loop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+  {% if pending %}<p class="next-action">결재 #{{ pending.approval_id }}이 {{ pending.authority }}의 결정을 기다리고 있습니다.</p>
+  {% elif unreceived %}<p class="next-action">미접수 {{ unreceived|length }}건이 있습니다. <a href="{{ url_for('index', month=month) }}">월 정산 접수 보기</a></p>
+  {% elif team and not supplements and review and not blockers %}
+  <form method="post" action="/approvals/submit" class="form-stack event-form">
+    {{ fields() }}<label>상신 사유<textarea name="note" rows="2" required></textarea></label>
+    <button class="primary">그룹 결재 상신</button>
+  </form>
+  {% elif not history and not blockers and not review %}
+  <p class="next-action">접수된 신규 심사 건이 없습니다. <a href="{{ url_for('index', month=month) }}">월 정산 접수 보기</a></p>
+  {% endif %}
+</section>
+{% include 'ai_drafts.html' %}
+<section class="work-card">
+  <div class="work-heading"><h2>결재 및 결정 기록</h2><span class="count">{{ history|length }}건</span></div>
+  {% for doc in history %}
+  {% set basis = doc.decision_snapshot or doc.snapshot %}
+  <article class="history-item" id="approval-{{ doc.approval_id }}">
+    <div class="item-heading"><h3>결재 #{{ doc.approval_id }} <small>버전 {{ doc.version }}</small></h3><span class="status-tag">{{ doc.status }}</span></div>
+    <p class="item-meta">{{ doc.period_ym }} · {{ doc.authority }} 승인 경로{% if doc.previous_id %} · 이전 결재 #{{ doc.previous_id }}{% endif %}</p>
+    {{ amount_pair(doc.monthly_total, doc.new_amount) }}
+    <dl class="log">
+      <dt>상신 · {{ role_label(doc.submitted_by) }} {{ time(doc.submitted_at) }}</dt><dd>{{ doc.note }}</dd>
+      {% if doc.decided_by %}<dt>결정 · {{ role_label(doc.decided_by) }} {{ time(doc.decided_at) }}</dt><dd>{{ doc.reason }}</dd>{% endif %}
+    </dl>
+    <details class="record-detail">
+      <summary>결재 당시 근거 · 정산 명세 <i class="chevron"></i></summary>
+      <p class="identifiers">{{ basis.members|join(' · ') }}</p>
+      {% for edge in basis.edges %}<p>{{ edge.left }} ↔ {{ edge.right }} · {{ edge['keys']|join(' · ') }} 일치</p>{% endfor %}
+      <div class="table-wrap" tabindex="0" role="region" aria-label="결재 명세">
+        <table class="compact-table"><thead><tr><th>대리점</th><th>정산건</th><th>포함 사유</th><th class="numeric">금액</th></tr></thead><tbody>
+          {% for line in basis.lines %}<tr><td>{{ line.agency_id }}</td><td>{{ line.rebate_id }}</td><td>{{ {'new':'이번 승인','paid':'기지급','approved':'승인 후 미집행'}.get(line.kind, line.kind) }}</td><td class="numeric">{{ money(line.amount) }}원</td></tr>{% endfor %}
+        </tbody></table>
+      </div>
+      {% for line in basis.lines if line.notes %}<p>{{ line.rebate_id }} · {{ line.notes|join(' / ') }}</p>{% endfor %}
+      {% for case in basis.cases %}<p>소명 #{{ case.case_id }} · {{ case.status }} · {{ case.question }}{% if case.answer %} · 답변 {{ case.answer }}{% endif %}{% if case.evidence %} · 증빙 {{ case.evidence }}{% endif %}{% if case.resolution %} · 검토 {{ case.resolution }}{% endif %}</p>{% endfor %}
+      {% for memo in basis.review_memos|default([]) %}<p><b>그룹 검토 메모 #{{ memo.draft_id }}</b> · {{ memo.text }} <small>{{ role_label(memo.reviewer) }} · {{ time(memo.reviewed_at) }}</small></p>{% endfor %}
+    </details>
+    {% if doc.status == '승인 대기' and ((doc.authority == '영업임원' and actor.role == 'executive') or (doc.authority == '영업지원팀' and actor.role == 'lead')) %}
+    <form method="post" action="/approvals/{{ doc.approval_id }}/decide" class="form-stack event-form">
+      {{ fields() }}
+      <label>결정 사유<textarea name="reason" rows="2" required></textarea></label>
+      <div class="button-row"><button class="primary" name="action" value="approve"{% if blockers %} disabled{% endif %}>승인</button><button class="secondary" name="action" value="supplement">보완 요청</button><button class="secondary danger" name="action" value="reject">반려</button></div>
+    </form>
+    {% endif %}
+    {% if team and doc.can_resubmit %}
+    <details class="record-detail">
+      <summary>{% if doc.status == '승인 대기' %}근거 갱신 후 재상신{% else %}보완 후 재상신{% endif %} <i class="chevron"></i></summary>
+      <form method="post" action="/approvals/submit" class="form-stack">
+        {{ fields() }}<input type="hidden" name="previous_id" value="{{ doc.approval_id }}">
+        <label>보완·재상신 사유<textarea name="note" rows="2" required></textarea></label>
+        <button class="secondary">재상신</button>
+      </form>
+    </details>
+    {% endif %}
+    {% if doc.status == '승인' %}<p class="next-action"><a class="work-link" href="{{ url_for('payments', month=month, group=selected_group) }}">대리점별 지급지시 보기 →</a></p>{% endif %}
+  </article>
+  {% else %}<p class="empty-copy">이 그룹의 결재 기록이 없습니다.</p>{% endfor %}
+</section>
+{% else %}<p class="empty-copy">선택한 월에 조회할 그룹이 없습니다.</p>{% endif %}
+{% endblock %}

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{ title }} · Corevia</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='intake.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='workflow.css') }}">
+  {% if section in ('cases','approvals') %}<script defer src="{{ url_for('static', filename='ai-drafts.js') }}"></script>{% endif %}
+  {% block scripts %}{% endblock %}
+</head>
+<body>
+<a href="#main" class="skip">본문으로 이동</a>
+<header class="masthead">
+  <div class="frame masthead-inner">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span><strong>Corevia</strong><span class="brand-product">판매장려금 관리</span></div>
+    <form class="identity-form" method="post" action="/identity">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="month" value="{{ month or '' }}">
+      <input type="hidden" name="group" value="{{ selected_group or '' }}">
+      <input type="hidden" name="next" value="{{ url_for(section) }}">
+      <label for="demo-user">시연 사용자</label>
+      <select id="demo-user" name="user_id">
+        {% for user in users %}<option value="{{ user.user_id }}"{% if user.user_id == actor.user_id %} selected{% endif %}>{{ user.label }}</option>{% endfor %}
+      </select>
+      <button type="submit">전환</button>
+    </form>
+  </div>
+</header>
+<nav class="work-nav" aria-label="판매장려금 업무">
+  <div class="frame">
+    {% for endpoint, label in [('index','월 정산 접수'),('cases','관련자·소명'),('approvals','그룹 결재'),('payments','지급지시·대사')] %}
+    <a href="{{ url_for(endpoint, month=month, group=selected_group if endpoint != 'index' else none) }}"{% if section == endpoint %} aria-current="page"{% endif %}>{{ label }}</a>
+    {% endfor %}
+  </div>
+</nav>
+<main class="frame" id="main">
+  {% block body %}{% endblock %}
+</main>
+</body>
+</html>

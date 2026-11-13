@@ -1,0 +1,91 @@
+{% extends "work_base.html" %}
+{% set section = 'payments' %}
+{% set title = '지급지시·대사' %}
+{% from 'work_forms.html' import money, selector, fields, feedback_box, role_label, time with context %}
+{% set states = {'held':'지급 보류','ready':'전송 준비','sent':'회신 대기','review':'대사 확인 중','failed':'지급 실패','completed':'대사 완료'} %}
+{% set outcomes = {'matched':'대사 완료','failed':'지급 실패','review':'대사 확인 중','unmatched':'지시 미연결','late':'추가 회신'} %}
+{% macro masked(account) -%}
+  {%- if account -%}{% set compact = account|replace('-','')|replace(' ','') %}•••• {{ compact[-4:] }}{%- else -%}미확인{%- endif -%}
+{%- endmacro %}
+{% macro reply_form(order=none) -%}
+<form class="form-stack" action="/payments/reply" method="post">
+  {{ fields() }}
+  {% if order %}<input type="hidden" name="attempt_id" value="{{ order.latest_attempt }}">
+    <p class="item-meta">시도 번호 <strong>{{ order.latest_attempt }}</strong></p>
+  {% else %}<label>시도 번호<input name="attempt_id" required placeholder="모의 회신에 기재된 지급 시도 번호"></label>{% endif %}
+  <div class="input-pair"><label>회신 번호<input name="reply_id" required placeholder="모의 은행 회신 식별자"></label>
+    <label>은행 처리결과<select name="result" required><option value="">선택</option><option value="success">성공</option><option value="failure">실패</option></select></label></div>
+  <div class="input-pair"><label>회신 금액(원)<input type="number" name="amount" min="0" step="1" required></label>
+    <label>회신 수취계좌<input name="account" required placeholder="은행명과 계좌번호"></label></div>
+  <button class="primary">모의 회신 대사</button>
+</form>
+{%- endmacro %}
+{% block body %}
+<section class="intro"><div><h1>지급지시·대사</h1><p>승인된 신규 건별로 수취계좌를 확인하고, 모의 지급지시와 은행 회신을 대조합니다.</p></div></section>
+{{ feedback_box() }}
+{{ selector(section, true) }}
+{% set treasury = actor.role == 'treasury' %}
+{% set chosen = overview.groups|selectattr('group_id','equalto',selected_group)|first if overview else none %}
+{% set visible_orders = orders|selectattr('agency_id','in',chosen.members)|list if selected_group and chosen else orders %}
+<section class="summary pay-summary" aria-label="지급지시 요약">
+  {% for label, value in [('지급지시',visible_orders|length),('지급 보류',visible_orders|selectattr('state','equalto','held')|list|length),('대사 완료',visible_orders|selectattr('state','equalto','completed')|list|length)] %}
+  <article class="metric"><h2>{{ label }}</h2><p class="metric-value">{{ value }}<small>건</small></p></article>
+  {% endfor %}
+</section>
+<section class="work-card">
+  <div class="work-heading"><h2>대리점별 지급지시</h2><span class="count">{{ visible_orders|length }}건</span></div>
+  {% for order in visible_orders %}
+  <details class="order">
+    <summary class="order-summary">
+      <span><strong>{{ order.agency_name }}</strong><span class="item-meta">{{ order.agency_id }} · {{ order.rebate_id }} · 지시 #{{ order.instruction_id }}</span></span>
+      <b class="order-amount">{{ money(order.amount_krw) }}원</b><span class="status-tag {{ order.state }}">{{ states[order.state] }}</span><i class="chevron"></i>
+    </summary>
+    <div class="order-content">
+      {% set src = overview.rows|selectattr('rebate_id','equalto',order.rebate_id)|first %}
+      <div class="work-heading"><h3>지급 근거</h3><a class="work-link" href="{{ url_for('approvals', month=month, group=src.group_id if src else none) }}">결재 #{{ order.approval_id }} 보기 →</a></div>
+      <dl class="log">
+        <dt>수취계좌</dt><dd>{{ masked(order.account) }}{% if order.evidence %} · {{ order.evidence }}{% endif %}</dd>
+        {% if order.verified_by %}<dt>확인자</dt><dd>{{ role_label(order.verified_by) }} {{ time(order.verified_at) }}</dd>{% endif %}
+      </dl>
+      {% if order.state == 'held' %}
+      <p class="attention">수취계좌 미확인으로 지급을 보류했습니다. 회계·자금이 별도 증빙으로 확인하면 모의 전송할 수 있습니다.</p>
+      {% if treasury %}
+      <form class="form-stack" method="post" action="/payments/{{ order.instruction_id }}/account">
+        {{ fields() }}
+        <div class="input-pair"><label>확인한 수취계좌<input name="account" required placeholder="증빙의 은행명과 계좌번호"></label>
+          <label>확인 증빙<input name="evidence" required placeholder="지급 수취계좌 확인서 또는 증빙 참조번호"></label></div>
+        <button class="primary">수취계좌 확인</button>
+      </form>{% endif %}
+      {% elif order.state in ('ready','failed') and treasury %}
+      <form method="post" action="/payments/{{ order.instruction_id }}/send" class="event-form">
+        {{ fields() }}
+        {% if order.state == 'failed' %}<input type="hidden" name="expected_attempt" value="{{ order.latest_attempt }}">{% endif %}
+        <button class="primary">{{ '실패 확인 후 모의 재전송' if order.state == 'failed' else '모의 지급지시 전송' }}</button>
+      </form>
+      {% endif %}
+      {% if order.attempts %}<h3 class="subheading">모의 전송 이력</h3><ul class="event-list">
+        {% for attempt in order.attempts %}<li><strong>{{ attempt.attempt_id }}</strong><span>{{ money(attempt.amount_krw) }}원 · {{ masked(attempt.account) }} · {{ role_label(attempt.sent_by) }} {{ time(attempt.sent_at) }}</span></li>{% endfor %}
+      </ul>{% endif %}
+      {% if order.replies %}<h3 class="subheading">은행 회신 및 대사</h3><ul class="event-list">
+        {% for reply in order.replies %}<li>
+          <strong>{{ reply.reply_id }} · {{ '은행 성공' if reply.result == 'success' else '은행 실패' }} · {{ outcomes[reply.outcome] }}</strong>
+          <span>{{ reply.attempt_id }} · {{ money(reply.amount_krw) }}원 · {{ masked(reply.account) }}</span>
+          <span>{{ reply.reason }} · {{ time(reply.received_at) }}</span>
+        </li>{% endfor %}
+      </ul>{% endif %}
+      {% if order.state in ('sent','review') and treasury %}
+      <div class="event-form"><h3 class="subheading">모의 은행 회신 입력</h3>{{ reply_form(order) }}</div>
+      {% endif %}
+    </div>
+  </details>
+  {% else %}<p class="empty-copy">승인된 신규 정산건의 지급지시가 없습니다.</p>{% endfor %}
+</section>
+{% if treasury or unmatched %}<section class="work-card">
+  {% if treasury %}
+  <details class="record-detail plain"><summary>시도 번호로 모의 회신 입력 <i class="chevron"></i></summary>{{ reply_form() }}</details>
+  {% endif %}
+  {% if unmatched %}<h3 class="subheading">지시 미연결 회신 · 전체 기간</h3><ul class="event-list">
+    {% for reply in unmatched %}<li><strong>{{ reply.reply_id }} · {{ reply.attempt_id }}</strong><span>{{ money(reply.amount_krw) }}원 · {{ masked(reply.account) }} · {{ '은행 성공' if reply.result == 'success' else '은행 실패' }}</span><span>{{ reply.reason }} · {{ time(reply.received_at) }}</span></li>{% endfor %}
+  </ul>{% endif %}
+</section>{% endif %}
+{% endblock %}
