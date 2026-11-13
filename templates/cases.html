@@ -3,8 +3,11 @@
 {% set title = '관련자·소명' %}
 {% from 'work_forms.html' import money, selector, fields, feedback_box, role_label, time with context %}
 {% block body %}
-<section class="intro">
-  <div><h1>관련자·소명</h1><p>등록정보와 회수 이력을 대조하고 대리점의 답변과 검토 결과를 기록합니다.</p></div>
+<section class="intro" aria-labelledby="page-title">
+  <hgroup>
+    <h1 id="page-title">관련 대리점 확인과 소명</h1>
+    <p>등록정보와 회수계좌를 대조하고, 확인이 필요한 건에 대해 대리점에 소명을 요청합니다.</p>
+  </hgroup>
 </section>
 {{ feedback_box() }}
 {{ selector(section) }}
@@ -16,7 +19,7 @@
 {% set requestable = (lines|selectattr('intake_at')|rejectattr('bucket','in',('paid_amount','approved_amount'))|list) + (lines|selectattr('rebate_id','in',recheck_ids)|list) %}
 {% set group_cases = cases|selectattr('agency_id','in',chosen.members)|list %}
 <section class="work-card group-evidence">
-  <div class="work-heading"><div><h2>그룹 판정 근거</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
+  <div class="work-heading"><div><h2>관련자 그룹 판정 근거</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
     <a class="work-link" href="{{ url_for('approvals', month=month, group=selected_group) }}">그룹 결재 보기 →</a></div>
   <div class="group-meta">
     <div><h3>등록정보 일치</h3>

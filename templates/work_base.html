@@ -7,6 +7,7 @@
   <title>{{ title }} · Corevia</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='intake.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='workflow.css') }}">
+  <script defer src="{{ url_for('static', filename='identity.js') }}"></script>
   {% if section in ('cases','approvals') %}<script defer src="{{ url_for('static', filename='ai-drafts.js') }}"></script>{% endif %}
   {% block scripts %}{% endblock %}
 </head>
@@ -24,7 +25,7 @@
       <select id="demo-user" name="user_id">
         {% for user in users %}<option value="{{ user.user_id }}"{% if user.user_id == actor.user_id %} selected{% endif %}>{{ user.label }}</option>{% endfor %}
       </select>
-      <button type="submit">전환</button>
+      <noscript><button type="submit">전환</button></noscript>
     </form>
   </div>
 </header>

@@ -17,10 +17,10 @@
   </dl>
 {%- endmacro %}
   <section class="intro" aria-labelledby="page-title">
-    <div>
-      <h1 id="page-title">월 정산 접수</h1>
-      <p>귀속월별 장려금을 확인하고, 미지급 건을 심사 대상으로 접수합니다.</p>
-    </div>
+    <hgroup>
+      <h1 id="page-title">월별 판매장려금 접수</h1>
+      <p>귀속월을 선택해 대리점별 장려금을 확인하고, 미지급 건을 심사 대상으로 접수합니다.</p>
+    </hgroup>
     <div class="actions">
       {% if months %}
       <form method="get" action="{{ url_for('index') }}" class="month-form">
@@ -50,7 +50,7 @@
   {% set stats = overview.stats %}
   <section class="summary" aria-label="{{ period(month) }} 정산 요약">
     <article class="metric">
-      <h2>미지급 장려금</h2>
+      <h2>미지급 장려금 합계</h2>
       <p class="metric-value">{{ money(stats.unpaid_amount) }}<small>원</small></p>
       <p class="metric-detail">{{ period(month) }} 적격 미지급 원장 합계</p>
     </article>
@@ -90,7 +90,7 @@
   {% endif %}
   <section class="ledger" aria-labelledby="ledger-title">
     <div class="ledger-header">
-      <div class="ledger-title"><h2 id="ledger-title">정산 내역</h2><span class="count">{{ stats.source_count }}건</span></div>
+      <div class="ledger-title"><h2 id="ledger-title">대리점별 정산 내역</h2><span class="count">{{ stats.source_count }}건</span></div>
       <label class="search js-only"><span class="search-icon" aria-hidden="true"></span><input type="search" id="ledger-search" aria-label="대리점 또는 정산 ID 검색" placeholder="대리점명, 대리점·정산 ID 검색"></label>
     </div>
     <div class="filter-line js-only">

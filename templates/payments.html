@@ -21,7 +21,12 @@
 </form>
 {%- endmacro %}
 {% block body %}
-<section class="intro"><div><h1>지급지시·대사</h1><p>승인된 신규 건별로 수취계좌를 확인하고, 모의 지급지시와 은행 회신을 대조합니다.</p></div></section>
+<section class="intro" aria-labelledby="page-title">
+  <hgroup>
+    <h1 id="page-title">지급지시와 은행 대사</h1>
+    <p>승인된 건의 수취계좌를 확인하고, 모의 은행 회신의 금액과 계좌를 지급지시와 대조합니다.</p>
+  </hgroup>
+</section>
 {{ feedback_box() }}
 {{ selector(section, true) }}
 {% set treasury = actor.role == 'treasury' %}
@@ -92,7 +97,7 @@
 </section>
 {% set post_reviews = correction_tasks|selectattr('kind','equalto','post_review')|list %}
 {% if post_reviews %}<section class="work-card" id="post-reviews">
-  <div class="work-heading"><h2>기지급 사후 검토</h2><span class="count">대기 {{ post_reviews|selectattr('status','equalto','open')|list|length }}건</span></div>
+  <div class="work-heading"><h2>기지급 건 사후 검토</h2><span class="count">대기 {{ post_reviews|selectattr('status','equalto','open')|list|length }}건</span></div>
   {% for task in post_reviews %}<article class="history-item">
     <div class="item-heading"><h3>{{ task.agency_id }} · {{ task.rebate_id }}</h3><span class="status-tag">{{ '검토 완료' if task.status == 'done' else '사후 검토 대기' }}</span></div>
     <p class="item-meta">작업 #{{ task.task_id }} · 정정 #{{ task.correction_id }} · {{ money(task.rebate_amount_krw) }}원 · {% if task.instruction_id %}지급지시 #{{ task.instruction_id }}{% else %}원장상 기지급{% endif %}</p>

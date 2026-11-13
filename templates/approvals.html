@@ -3,7 +3,12 @@
 {% set title = '그룹 결재' %}
 {% from 'work_forms.html' import money, selector, fields, feedback_box, role_label, time, amount_pair with context %}
 {% block body %}
-<section class="intro"><div><h1>그룹 결재</h1><p>월 누계로 승인권자를 확인하고 이번에 지급할 신규 정산건을 결정합니다.</p></div></section>
+<section class="intro" aria-labelledby="page-title">
+  <hgroup>
+    <h1 id="page-title">그룹별 장려금 결재</h1>
+    <p>그룹의 월 누계로 승인권자를 확인하고, 이번 승인 요청액과 그 근거를 검토합니다.</p>
+  </hgroup>
+</section>
 {{ feedback_box() }}
 {{ selector(section) }}
 {% set chosen = overview.groups|selectattr('group_id','equalto',selected_group)|first if overview else none %}
@@ -20,7 +25,7 @@
 {% set reapproval_lines = reapprovals|unique(attribute='rebate_id')|list %}
 {% set unreceived = grouped_rows|selectattr('bucket','equalto','pending_amount')|list %}
 <section class="work-card">
-  <div class="work-heading"><div><h2>현재 심사 대상</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
+  <div class="work-heading"><div><h2>월 누계와 승인 요청액</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
     <a class="work-link" href="{{ url_for('cases', month=month, group=selected_group) }}">관련자·소명 보기 →</a></div>
   {{ amount_pair(chosen.total, chosen.review_amount) }}
   {% if reapprovals %}<p class="attention">정정 후 재승인 대상 {{ reapproval_lines|length }}건 · <b>{{ money(reapproval_lines|sum(attribute='rebate_amount_krw')) }}원</b> · {{ chosen.authority }} 재상신</p>
@@ -40,7 +45,7 @@
 </section>
 {% include 'ai_drafts.html' %}
 <section class="work-card">
-  <div class="work-heading"><h2>결재 및 결정 기록</h2><span class="count">{{ history|length }}건</span></div>
+  <div class="work-heading"><h2>결재 이력</h2><span class="count">{{ history|length }}건</span></div>
   {% for doc in history %}
   {% set basis = doc.decision_snapshot or doc.snapshot %}
   <article class="history-item" id="approval-{{ doc.approval_id }}">
