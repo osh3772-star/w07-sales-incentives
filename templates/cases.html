@@ -12,8 +12,9 @@
 {% set chosen = overview.groups|selectattr('group_id','equalto',selected_group)|first if overview else none %}
 {% if chosen %}
 {% set lines = overview.rows|selectattr('group_id','equalto',selected_group)|list %}
-{% set requestable = lines|selectattr('intake_at')|rejectattr('bucket','in',('paid_amount','approved_amount'))|list %}
-{% set group_cases = cases|selectattr('group_id','equalto',selected_group)|list %}
+{% set recheck_ids = correction_tasks|selectattr('kind','equalto','reapproval')|selectattr('status','equalto','open')|map(attribute='rebate_id')|list %}
+{% set requestable = (lines|selectattr('intake_at')|rejectattr('bucket','in',('paid_amount','approved_amount'))|list) + (lines|selectattr('rebate_id','in',recheck_ids)|list) %}
+{% set group_cases = cases|selectattr('agency_id','in',chosen.members)|list %}
 <section class="work-card group-evidence">
   <div class="work-heading"><div><h2>그룹 판정 근거</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
     <a class="work-link" href="{{ url_for('approvals', month=month, group=selected_group) }}">그룹 결재 보기 →</a></div>
@@ -29,6 +30,7 @@
     </div>
   </div>
 </section>
+{% include 'correction_history.html' %}
 {% include 'ai_drafts.html' %}
 <div class="work-grid">
   <section class="work-card">

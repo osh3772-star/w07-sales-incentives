@@ -1,5 +1,6 @@
 """W07 registered-agency relationships and settlement-month intake totals."""
 
+import json
 import re
 import sqlite3
 from collections import defaultdict
@@ -7,6 +8,19 @@ from itertools import combinations
 
 
 LIMIT_KRW = 2_000_000
+IDENTITY_FIELDS = ("representative_name", "address", "bank_account_no")
+
+
+def effective_agencies(db, as_of):
+    """Overlay only changed fields. A YYYY-MM cutoff represents the end of that month."""
+    cutoff = as_of + "-31" if len(as_of) == 7 else as_of
+    agencies = {row["agency_id"]: dict(row) for row in db.execute("SELECT * FROM agencies ORDER BY agency_id")}
+    for change in db.execute(
+        """SELECT agency_id, after_json FROM agency_corrections WHERE effective_date <= ?
+           ORDER BY effective_date, correction_id""", (cutoff,),
+    ):
+        agencies[change["agency_id"]].update(json.loads(change["after_json"]))
+    return list(agencies.values())
 
 
 def authority_for(amount):
@@ -94,7 +108,7 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
     # see the same committed revision, even as another request receives a month.
     db.execute("SAVEPOINT overview_snapshot")
     try:
-        agencies = db.execute("SELECT * FROM agencies ORDER BY agency_id").fetchall()
+        agencies = effective_agencies(db, month)
         # The most recent application for a rebate controls its review state.
         # Reference lines on later applications do not change an earlier decision.
         applications = {

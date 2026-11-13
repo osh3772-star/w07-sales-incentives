@@ -2,7 +2,7 @@
 
 import uuid
 
-from rules import account_key
+from rules import account_key, month_overview
 from workflow_security import require_role
 
 
@@ -54,12 +54,71 @@ def create_instructions(db, approval_id):
     ).fetchone()
     if overlap:
         raise ValueError(f"{overlap['rebate_id']}에는 이미 유효한 지급지시가 있습니다.")
+    blocked = db.execute(
+        """SELECT l.rebate_id FROM approval_lines l JOIN correction_tasks t USING(rebate_id)
+           WHERE l.approval_id=? AND l.kind='new' AND t.status='open'
+           AND NOT EXISTS (SELECT 1 FROM payment_instructions i
+                           WHERE i.rebate_id=l.rebate_id AND i.approval_id=l.approval_id)
+           LIMIT 1""", (approval_id,),
+    ).fetchone()
+    if blocked:
+        raise ValueError(f"{blocked['rebate_id']}의 정정 후속 작업을 먼저 처리하세요.")
     return db.execute(
         """INSERT INTO payment_instructions(approval_id, rebate_id, agency_id, amount_krw)
            SELECT approval_id, rebate_id, agency_id, amount FROM approval_lines
            WHERE approval_id=? AND kind='new' ON CONFLICT(rebate_id) DO NOTHING""",
         (approval_id,),
     ).rowcount
+
+
+def authorize_corrected_orders(db, approval_id, task_ids):
+    """Link the fresh decision to held obligations; keep the original instructions and evidence."""
+    if not db.in_transaction:
+        raise RuntimeError("재승인은 결재 결정과 함께 저장해야 합니다.")
+    for task_id in task_ids:
+        task = db.execute(
+            """SELECT t.status, t.kind, t.reapproval_id, i.state, i.amount_krw, l.amount
+               FROM correction_tasks t
+               JOIN approval_lines l ON l.rebate_id=t.rebate_id AND l.kind='approved'
+               JOIN approvals a ON a.approval_id=l.approval_id AND a.period_ym=t.period_ym
+               LEFT JOIN payment_instructions i ON i.instruction_id=t.instruction_id
+               WHERE t.task_id=? AND a.approval_id=? AND a.status='승인'""",
+            (task_id, approval_id),
+        ).fetchone()
+        if not task or task["kind"] != "reapproval":
+            raise ValueError("재승인할 지급 건과 승인 명세가 일치하지 않습니다.")
+        if task["status"] == "done" and task["reapproval_id"] == approval_id:
+            continue
+        if (task["status"] != "open" or task["state"] not in (None, "held", "ready", "failed")
+                or (task["state"] and task["amount_krw"] != task["amount"])):
+            raise ValueError("지급 상태가 바뀌었습니다. 기존 지급지시의 처리 결과를 확인하세요.")
+        db.execute(
+            """UPDATE correction_tasks SET status='done', reapproval_id=?,
+                      resolved_by=(SELECT decided_by FROM approvals WHERE approval_id=?),
+                      resolved_at=CURRENT_TIMESTAMP, resolution='정정 근거 재승인'
+               WHERE task_id=?""", (approval_id, approval_id, task_id),
+        )
+
+
+def _check_dispatch_allowed(db, instruction_id):
+    tasks = {row["kind"] for row in db.execute(
+        "SELECT kind FROM correction_tasks WHERE instruction_id=? AND status='open'", (instruction_id,),
+    )}
+    if "bank_check" in tasks:
+        raise ValueError("이미 전송한 지급지시입니다. 재전송을 보류하고 기존 시도의 은행 결과부터 확인하세요.")
+    if "reapproval" in tasks:
+        raise ValueError("등록정보 정정으로 지급 보류 상태입니다. 최신 근거로 재승인을 받아야 합니다.")
+
+
+_ACCOUNT_RECHECKS_DUE = """
+    SELECT t.task_id, t.instruction_id FROM correction_tasks t
+    JOIN payment_instructions i USING(instruction_id)
+    JOIN agency_corrections c USING(correction_id)
+    LEFT JOIN payment_account_rechecks h USING(task_id)
+    WHERE i.state IN ('held','ready','failed') AND t.reapproval_id IS NOT NULL
+      AND i.agency_id=c.agency_id AND json_type(c.after_json,'$.bank_account_no') IS NOT NULL
+      AND h.task_id IS NULL
+"""
 
 
 def _instruction(db, instruction_id):
@@ -81,7 +140,7 @@ def _text(value, field):
 
 
 def confirm_account(db, actor, instruction_id, account, evidence):
-    """Freeze the independently confirmed recipient on this instruction before its first send."""
+    """Verify the recipient, retaining every earlier verification when registration changes."""
     require_role(actor, "treasury")
     account = _text(account, "수취계좌")
     evidence = _text(evidence, "수취계좌 확인 증빙")
@@ -90,13 +149,26 @@ def confirm_account(db, actor, instruction_id, account, evidence):
     with db:
         db.execute("BEGIN IMMEDIATE")
         order = _instruction(db, instruction_id)
-        if order["state"] != "held":
+        _check_dispatch_allowed(db, instruction_id)
+        checks = db.execute(_ACCOUNT_RECHECKS_DUE + " AND t.instruction_id=?", (instruction_id,)).fetchall()
+        if order["state"] != "held" and not checks:
             if order["account"] == account and order["evidence"] == evidence:
                 return
             raise ValueError("이미 확인된 수취계좌·증빙은 이 화면에서 변경할 수 없습니다.")
+        for check in checks:
+            db.execute(
+                """INSERT INTO payment_account_rechecks
+                   (task_id,instruction_id,previous_account,previous_evidence,previous_verified_by,
+                    previous_verified_at,account,evidence,verified_by,verified_at)
+                   SELECT ?,instruction_id,account,evidence,verified_by,verified_at,?,?,?,
+                          strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   FROM payment_instructions WHERE instruction_id=?""",
+                (check["task_id"], account, evidence, actor.user_id, instruction_id),
+            )
         db.execute(
             """UPDATE payment_instructions SET account=?, evidence=?, verified_by=?,
-                      verified_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), state='ready'
+                      verified_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                      state=CASE WHEN state='held' THEN 'ready' ELSE state END
                WHERE instruction_id=?""", (account, evidence, actor.user_id, instruction_id),
         )
 
@@ -107,6 +179,9 @@ def send_mock(db, actor, instruction_id, expected_attempt=None):
     with db:
         db.execute("BEGIN IMMEDIATE")
         order = _instruction(db, instruction_id)
+        _check_dispatch_allowed(db, instruction_id)
+        if db.execute(_ACCOUNT_RECHECKS_DUE + " AND t.instruction_id=? LIMIT 1", (instruction_id,)).fetchone():
+            raise ValueError("등록계좌가 정정되었습니다. 회계에서 수취계좌와 증빙을 다시 확인해야 합니다.")
         if order["state"] == "held" or not order["account"]:
             raise ValueError("수취계좌와 증빙을 확인할 때까지 지급 보류 상태입니다.")
         latest = db.execute(
@@ -161,6 +236,35 @@ def _compare_reply(attempt, amount, account, result):
     return "matched", "completed", "금액·수취계좌 일치, 모의 은행 성공 확인."
 
 
+def _record_correction_followup(db, instruction_id, state, reply_id, actor):
+    # Keep a resolved bank inquiry and its follow-up as separate auditable tasks.
+    tasks = db.execute(
+        """SELECT * FROM correction_tasks WHERE instruction_id=? AND status='open'
+           AND kind IN ('bank_check','reapproval') ORDER BY task_id""", (instruction_id,),
+    ).fetchall()
+    if not tasks:
+        return
+    next_kind = {"completed": "post_review", "failed": "reapproval", "review": "bank_check"}[state]
+    moving = [task for task in tasks if task["kind"] != next_kind]
+    if not moving:
+        return
+    # The original correction might have been followed by a second merge or split.
+    row = moving[0]
+    group_id = next(line["group_id"] for line in month_overview(db, row["period_ym"])["rows"]
+                    if line["rebate_id"] == row["rebate_id"])
+    for task in moving:
+        db.execute(
+            """UPDATE correction_tasks SET status='done', resolved_by=?, resolved_at=CURRENT_TIMESTAMP,
+                      resolution=? WHERE task_id=?""", (actor.user_id, f"모의 은행 회신 {reply_id}", task["task_id"]),
+        )
+        db.execute(
+            """INSERT INTO correction_tasks(correction_id,period_ym,group_id,rebate_id,instruction_id,kind)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(correction_id,rebate_id,kind) WHERE status='open' DO NOTHING""",
+            (task["correction_id"], task["period_ym"], group_id, task["rebate_id"], instruction_id, next_kind),
+        )
+
+
 def record_reply(db, actor, reply_id, attempt_id, amount, account, result):
     require_role(actor, "treasury")
     reply_id = _text(reply_id, "모의 회신 번호")
@@ -198,6 +302,7 @@ def record_reply(db, actor, reply_id, attempt_id, amount, account, result):
         if state:
             db.execute("UPDATE payment_instructions SET state=? WHERE instruction_id=?",
                        (state, attempt["instruction_id"]))
+            _record_correction_followup(db, attempt["instruction_id"], state, reply_id, actor)
         return outcome
 
 
@@ -206,13 +311,35 @@ def list_payments(db, month):
     db.execute("SAVEPOINT payment_view")
     try:
         orders = [
-            dict(row, attempts=[], replies=[], latest_attempt=None) for row in db.execute(
+            dict(row, attempts=[], replies=[], latest_attempt=None, queue_state=row["state"],
+                 correction_tasks=[], account_rechecks=[], post_review=False, effective_approval_id=row["approval_id"])
+            for row in db.execute(
                 """SELECT i.*, a.period_ym, g.agency_name FROM payment_instructions i
                    JOIN approvals a USING(approval_id) JOIN agencies g USING(agency_id)
                    WHERE a.period_ym=? ORDER BY i.instruction_id DESC""", (month,),
             )
         ]
         by_order = {order["instruction_id"]: order for order in orders}
+        for due in db.execute(_ACCOUNT_RECHECKS_DUE + " AND t.period_ym=?", (month,)):
+            by_order[due["instruction_id"]]["queue_state"] = "account_recheck"
+        for check in db.execute(
+            """SELECT h.* FROM payment_account_rechecks h JOIN correction_tasks t USING(task_id)
+               WHERE t.period_ym=? ORDER BY h.task_id""", (month,),
+        ):
+            by_order[check["instruction_id"]]["account_rechecks"].append(dict(check))
+        for task in db.execute(
+            """SELECT * FROM correction_tasks WHERE period_ym=? AND instruction_id IS NOT NULL
+               ORDER BY task_id""", (month,),
+        ):
+            order = by_order[task["instruction_id"]]
+            order["correction_tasks"].append(dict(task))
+            if task["status"] == "open":
+                if task["kind"] == "post_review":
+                    order["post_review"] = True
+                elif task["kind"] == "bank_check" or order["queue_state"] != "bank_check":
+                    order["queue_state"] = task["kind"]
+            if task["reapproval_id"] is not None:
+                order["effective_approval_id"] = max(order["effective_approval_id"], task["reapproval_id"])
         for attempt in db.execute(
             """SELECT t.* FROM mock_payment_attempts t JOIN payment_instructions i USING(instruction_id)
                JOIN approvals a USING(approval_id) WHERE a.period_ym=? ORDER BY t.sequence_no""", (month,),

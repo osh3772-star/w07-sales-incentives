@@ -65,7 +65,14 @@ a:focus-visible, textarea:focus-visible { outline: 3px solid #518d7c; outline-of
 .compact-table th:first-child { padding-left: 10px; }
 .button-row { gap: 7px; }
 .danger { color: #984431; }
-.pay-summary { margin-bottom: 16px; }
+.pay-summary { margin-bottom: 16px; grid-template-columns: repeat(4,minmax(0,1fr)); }
+@media (max-width: 650px) {
+  .pay-summary { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .pay-summary .metric:first-child { grid-column: auto; border-bottom: 0; }
+  .pay-summary .metric:nth-child(even) { border-left: 1px solid var(--line); }
+  .pay-summary .metric:nth-child(3) { border-left: 0; }
+  .pay-summary .metric:nth-child(n+3) { border-top: 1px solid var(--line); }
+}
 .order { border-top: 1px solid var(--line); }
 .order-summary { display: grid; grid-template-columns: minmax(0,1fr) auto auto auto; align-items: center; gap: 14px; padding: 13px 0; }
 .order-summary .item-meta,.event-list span { display: block; }

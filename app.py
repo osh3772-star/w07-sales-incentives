@@ -9,9 +9,10 @@ from flask import Flask, flash, get_flashed_messages, redirect, render_template,
 
 import ai_drafts
 import approvals as decisions
+import corrections
 import payments as settlement
 from ai_provider import ProviderError
-from rules import month_overview
+from rules import effective_agencies, month_overview
 from store import available_months, open_db, receive_month, sync_sources
 from workflow_security import USERS, require_role
 
@@ -50,9 +51,10 @@ def create_app(database=None, source_root=SOURCE_ROOT):
             overview = month_overview(db, month) if month else None
             groups = overview["groups"] if overview else []
             if group and group not in {item["group_id"] for item in groups}:
-                error = error or "이 정산월에서 찾을 수 없는 그룹입니다."
-                status = 400 if status == 200 else status
-                group = None
+                group = next((item["group_id"] for item in groups if group in item["members"]), None)
+                if group is None:
+                    error = error or "이 정산월에서 찾을 수 없는 그룹입니다."
+                    status = 400 if status == 200 else status
             if not group and groups and screen in ("cases", "approvals"):
                 group = next((item["group_id"] for item in groups if len(item["members"]) > 1),
                              groups[0]["group_id"])
@@ -60,8 +62,18 @@ def create_app(database=None, source_root=SOURCE_ROOT):
             if screen in ("cases", "approvals"):
                 details["cases"] = decisions.list_cases(db, month)
                 details["ai_drafts"] = ai_drafts.list_drafts(db, month, group) if group else []
+            if screen == "cases" and group:
+                members = next(item["members"] for item in groups if item["group_id"] == group)
+                details["master_members"] = [row for row in effective_agencies(db, month)
+                                             if row["agency_id"] in members]
+                details["agency_versions"] = corrections.agency_versions(db)
+                details["correction_history"] = corrections.list_corrections(db, month, group)
+            if screen in ("cases", "approvals", "payments"):
+                details["correction_tasks"] = corrections.list_tasks(db, month, group)
             if screen == "approvals":
-                details["approvals"] = decisions.list_approvals(db, month)
+                details["approvals"] = [dict(doc, can_resubmit=group in doc["resubmittable_groups"])
+                                        for doc in decisions.list_approvals(db, month)
+                                        if group in doc["visible_groups"]]
             if screen == "payments":
                 details.update(settlement.list_payments(db, month))
         return render_template(
@@ -143,6 +155,19 @@ def create_app(database=None, source_root=SOURCE_ROOT):
             number = decisions.request_case(db, actor(), form("rebate_id"), form("question"),
                                             form("required") in ("1", "on"), form("due_date"))
         return success(f"소명 요청 #{number}을 기록했습니다.")
+
+    @app.post("/cases/correct")
+    def correct_agency():
+        version = form("expected_version")
+        if not version.isascii() or not version.isdecimal():
+            raise ValueError("등록정보 화면을 새로 열고 정정할 버전을 확인하세요.")
+        agency = form("agency_id")
+        changes = {key: form(key) for key in ("representative_name", "address", "bank_account_no") if form(key)}
+        with closing(open_db(db_path)) as db:
+            number = corrections.apply_correction(db, actor(), agency, changes, form("effective_date"),
+                                                  form("reason"), form("evidence"), expected_version=int(version))
+        flash(f"{agency} 등록정보 정정 #{number}을 기록했습니다.")
+        return redirect(url_for("cases", month=form("month"), group=agency, _anchor="corrections"), code=303)
 
     @app.post("/cases/ai/generate")
     @app.post("/approvals/ai/generate")
@@ -234,6 +259,12 @@ def create_app(database=None, source_root=SOURCE_ROOT):
         outcomes = {"matched": "대사 완료", "failed": "지급 실패", "review": "대사 확인 중",
                     "unmatched": "미연결 회신", "late": "사후 회신"}
         return success(f"모의 은행 회신을 기록했습니다. {outcomes.get(result, result)}")
+
+    @app.post("/payments/tasks/<int:task_id>/complete")
+    def complete_post_review(task_id):
+        with closing(open_db(db_path)) as db:
+            corrections.complete_post_review(db, actor(), task_id, form("note"))
+        return success(f"사후 검토 #{task_id}의 결과를 기록했습니다.", anchor="post-reviews")
 
     return app
 

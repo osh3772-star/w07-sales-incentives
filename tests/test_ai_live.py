@@ -57,6 +57,11 @@ class LiveDraftTest(unittest.TestCase):
                 post(f"/cases/{case['case_id']}/resolve", reason="검증용 회신 기록 확인. 그룹 합산 유지.")
 
                 summary = generate(db, "cases", "summary")
+                context = json.loads(summary["evidence_json"])
+                self.assertEqual(context["monthly_total_krw"], 3_888_097)
+                self.assertEqual(len(context["edges"]), 2)
+                self.assertTrue(any("공동 수금 약정" in (item["answer"] or "") for item in context["cases"]))
+                self.assertIn("DP-00013", summary["evidence_json"])
                 revised_summary = summary["original_text"] + "\n검토 메모: 회수계좌와 지급 수취계좌는 별도로 확인한다."
                 post(f"/cases/ai/{summary['draft_id']}/adopt", edited_text=revised_summary)
 
@@ -67,7 +72,8 @@ class LiveDraftTest(unittest.TestCase):
                 approval, = db.execute("SELECT * FROM approvals").fetchall()
                 self.assertEqual((approval["note"], approval["status"], approval["monthly_total"], approval["new_amount"]),
                                  (revised_proposal, "승인 대기", 3_888_097, 3_888_097))
-                self.assertIn(revised_summary, json.dumps(json.loads(approval["snapshot"]), ensure_ascii=False))
+                memo, = json.loads(approval["snapshot"])["review_memos"]
+                self.assertEqual((memo["draft_id"], memo["text"]), (summary["draft_id"], revised_summary))
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM payment_instructions").fetchone()[0], 0)
                 drafts = [dict(row) for row in db.execute(
                     "SELECT draft_id,kind,model,provider,request_id,original_text,adopted_text,adopted_by FROM ai_drafts ORDER BY draft_id"
@@ -77,7 +83,7 @@ class LiveDraftTest(unittest.TestCase):
                     self.assertNotEqual(draft["original_text"], draft["adopted_text"])
                     self.assertEqual(draft["adopted_by"], "staff")
                     print("LIVE", draft["kind"], draft["provider"], draft["model"], draft["request_id"],
-                          f"{len(draft['original_text'])}자", flush=True)
+                          f"{len(draft['original_text'])}자", draft["original_text"], flush=True)
 
             # Re-open using a new Flask application and a fresh session.
             client = create_app(path, SOURCE_ROOT).test_client()

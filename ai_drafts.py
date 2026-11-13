@@ -3,8 +3,9 @@
 import json
 import re
 
-from approvals import approval_write, list_approvals, list_cases, request_case, submit_approval
-from rules import authority_for, month_overview
+from approvals import (approval_write, correction_flags, current_memos, list_approvals, list_cases,
+                       reapproval_tasks, request_case, submit_approval)
+from rules import authority_for, effective_agencies, month_overview, registered_groups
 from workflow_security import require_role
 
 
@@ -29,6 +30,9 @@ def _masker(db, cases):
     protected = set()
     for agency in db.execute("SELECT agency_name,representative_name,address,business_reg_no,bank_account_no FROM agencies"):
         protected.update(agency)
+    for correction in db.execute("SELECT before_json,after_json FROM agency_corrections"):
+        for values in correction:
+            protected.update(json.loads(values).values())
     protected.update(row[0] for row in db.execute("SELECT DISTINCT bank_account_no FROM deposits"))
     protected.update(case["respondent"] for case in cases)
     literals = [re.escape(value) for value in sorted(filter(None, protected), key=len, reverse=True)
@@ -36,6 +40,9 @@ def _masker(db, cases):
     names = re.compile("|".join(literals)) if literals else None
     # Account/phone/business identifiers, e-mail addresses, and links not present in the master.
     private = re.compile(r"(?:https?://|www\.)\S+|[\w.+-]+@[\w.-]+\.[\w-]+|"
+                         r"(?:[A-Za-z가-힣0-9·]+[시군구읍면동리로길]\s+){1,6}\d+(?:-\d+)?"
+                         r"(?:\s*\d+(?:동|호))*|"
+                         r"(?:담당자|성명|이름)\s*[:=]\s*[가-힣]{2,5}|"
                          r"(?<!\d)\d(?:[\s.()-]*\d){6,}(?!\d)", re.IGNORECASE)
 
     def mask(text):
@@ -44,6 +51,28 @@ def _masker(db, cases):
             text = names.sub("[비공개]", text)
         return private.sub("[비공개]", text)
     return mask
+
+
+def _applicable_corrections(db, month, members, *, since=0):
+    notices = []
+    for row in db.execute(
+        """SELECT c.correction_id,c.agency_id,c.effective_date,c.after_json,
+                  i.before_json AS previous_groups,i.after_json AS current_groups
+           FROM agency_corrections c JOIN correction_impacts i
+                ON i.correction_id=c.correction_id AND i.period_ym=?
+           WHERE c.effective_date<=? AND c.correction_id>? ORDER BY c.correction_id""",
+        (month, month + "-31", since),
+    ):
+        impacted = {row["agency_id"]}
+        for groups in (row["previous_groups"], row["current_groups"]):
+            if groups:
+                for group in json.loads(groups):
+                    impacted.update(group["members"])
+        if impacted.intersection(members):
+            notices.append({"correction_id": row["correction_id"], "agency_id": row["agency_id"],
+                            "effective_date": row["effective_date"],
+                            "changed_fields": sorted(json.loads(row["after_json"]))})
+    return notices
 
 
 def _scope(db, month, group_id, kind, rebate_id, previous_id):
@@ -58,15 +87,17 @@ def _scope(db, month, group_id, kind, rebate_id, previous_id):
     if not group:
         raise ValueError("해당 정산월에서 관련자 그룹을 찾을 수 없습니다.")
     rows = [row for row in data["rows"] if row["group_id"] == group_id]
+    tasks = reapproval_tasks(db, month)
     if kind == "question":
         target = next((r for r in rows if r["rebate_id"] == rebate_id), None)
-        if not target or not target["intake_at"] or target["bucket"] in ("paid_amount", "approved_amount"):
+        if (not target or target["bucket"] == "paid_amount" or
+                (rebate_id not in tasks and (not target["intake_at"] or target["bucket"] == "approved_amount"))):
             raise ValueError("그룹에서 소명을 요청할 접수 건을 선택하세요.")
-    history = [doc for doc in list_approvals(db, month) if doc["group_id"] == group_id]
+    history = [doc for doc in list_approvals(db, month) if group_id in doc["visible_groups"]]
     if previous_id is not None:
-        if not any(doc["approval_id"] == previous_id and doc["can_resubmit"] for doc in history):
+        if not any(doc["approval_id"] == previous_id and group_id in doc["resubmittable_groups"] for doc in history):
             raise ValueError("재상신할 수 있는 결재 버전을 선택하세요.")
-    cases = [case for case in list_cases(db, month) if case["group_id"] == group_id]
+    cases = [case for case in list_cases(db, month) if case["agency_id"] in group["members"]]
     mask = _masker(db, cases)
     lines = []
     reopened = 0
@@ -79,11 +110,8 @@ def _scope(db, month, group_id, kind, rebate_id, previous_id):
         lines.append({"agency_id": row["agency_id"], "rebate_id": row["rebate_id"],
                       "amount_krw": row["amount"], "state": row["state"], "included": row["included"] or bool(reopen),
                       "notes": row["notes"]})
-    memos = db.execute(
-        """SELECT draft_id, adopted_text FROM ai_drafts WHERE period_ym=? AND group_id=?
-           AND kind='summary' AND adopted_at IS NOT NULL ORDER BY draft_id""", (month, group_id),
-    )
-    return {
+    memos = current_memos(db, month, group_id)
+    context = {
         "period_ym": month, "group_id": group_id, "members": group["members"], "edges": group["edges"],
         "monthly_total_krw": group["total"] + reopened, "new_amount_krw": group["review_amount"] + reopened,
         "paid_krw": group["paid_amount"], "approved_unpaid_krw": group["approved_amount"],
@@ -95,8 +123,16 @@ def _scope(db, month, group_id, kind, rebate_id, previous_id):
                    "required": bool(c["required"]), "question": mask(c["question"]),
                    "answer": mask(c["answer"]), "resolution": mask(c["resolution"]),
                    "has_evidence": bool(c["evidence"])} for c in cases],
-        "review_memos": [{"id": m["draft_id"], "text": mask(m["adopted_text"])} for m in memos],
+        "review_memos": [{"id": m["draft_id"], "text": mask(m["text"])} for m in memos],
     }
+    notices = _applicable_corrections(db, month, group["members"])
+    if notices:
+        context["registration_changes"] = notices
+        reconsidered = [r for r in rows if r["rebate_id"] in tasks and r["bucket"] == "approved_amount"]
+        context["reapproval_rebate_ids"] = [r["rebate_id"] for r in reconsidered]
+        context["reapproval_amount_krw"] = sum(r["amount"] for r in reconsidered)
+        context["review_required_approval_ids"] = [d["approval_id"] for d in history if d["review_required"]]
+    return context
 
 
 def _serialized(context):
@@ -111,6 +147,7 @@ def generate_draft(db, actor, month, group, kind, rebate_id=None, *, provider=No
         db.execute("BEGIN")
         evidence = _scope(db, month, group, kind, rebate_id or None, previous_id)
         evidence_json = _serialized(evidence)
+        revision = db.execute("SELECT COALESCE(MAX(correction_id),0) FROM agency_corrections").fetchone()[0]
     if provider is None:
         from ai_provider import generate_text
         provider = generate_text
@@ -119,18 +156,29 @@ def generate_draft(db, actor, month, group, kind, rebate_id=None, *, provider=No
                                                for k in ("text", "provider", "model")):
         raise ValueError("모델 초안이나 호출 출처가 올바르지 않아 저장하지 못했습니다.")
     with approval_write(db):
-        return db.execute(
+        draft_id = db.execute(
             """INSERT INTO ai_drafts(period_ym,group_id,kind,rebate_id,previous_id,evidence_json,
                       original_text,provider,model,request_id,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (month, group, kind, rebate_id or None, previous_id, evidence_json, result["text"],
              result["provider"], result["model"], result.get("request_id"), actor.user_id),
         ).lastrowid
+        # The provider runs outside the write lock. A late result retains the input revision it actually used.
+        for change in _applicable_corrections(db, month, evidence["members"], since=revision):
+            db.execute("""INSERT INTO correction_flags(correction_id,target_kind,target_id,period_ym)
+                          VALUES(?,'draft',?,?)""", (change["correction_id"], draft_id, month))
+        return draft_id
 
 
 def list_drafts(db, month, group):
-    return [dict(row) for row in db.execute(
-        "SELECT * FROM ai_drafts WHERE period_ym=? AND group_id=? ORDER BY draft_id DESC", (month, group),
-    )]
+    flags = correction_flags(db, month, "draft")
+    groups, _ = registered_groups(effective_agencies(db, month))
+    members = set(groups.get(group, {}).get("members", ()))
+    result = []
+    for row in db.execute("SELECT * FROM ai_drafts WHERE period_ym=? ORDER BY draft_id DESC", (month,)):
+        ids = flags.get(row["draft_id"], [])
+        if row["group_id"] == group or (ids and members.intersection(json.loads(row["evidence_json"])["members"])):
+            result.append(dict(row, review_required=bool(ids), correction_ids=ids))
+    return result
 
 
 def adopt_draft(db, actor, draft_id, edited_text, *, required=False, due_date="",
@@ -148,7 +196,15 @@ def adopt_draft(db, actor, draft_id, edited_text, *, required=False, due_date=""
         if row["adopted_at"]:
             if row["adopted_text"] != text or row["adopted_by"] != actor.user_id:
                 raise ValueError("이미 채택된 초안입니다. 채택 기록을 확인하세요.")
+            if row["case_id"] is not None:
+                case = db.execute("SELECT required,due_date FROM explanations WHERE case_id=?",
+                                  (row["case_id"],)).fetchone()
+                if (case["required"], case["due_date"]) != (bool(required), due_date):
+                    raise ValueError("다른 조건으로 이미 채택된 소명 질문입니다. 요청 이력을 확인하세요.")
             return dict(row)
+        if db.execute("SELECT 1 FROM correction_flags WHERE target_kind='draft' AND target_id=?",
+                      (draft_id,)).fetchone():
+            raise ValueError("등록정보 정정으로 업무 근거가 바뀌었습니다. 재검토 후 최신 근거로 초안을 생성하세요.")
         latest = _scope(db, row["period_ym"], row["group_id"], row["kind"], row["rebate_id"], row["previous_id"])
         if _serialized(latest) != row["evidence_json"]:
             raise ValueError("생성 이후 업무 근거가 바뀌었습니다. 최신 근거로 초안을 다시 생성하세요.")

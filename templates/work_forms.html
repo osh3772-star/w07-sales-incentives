@@ -34,7 +34,7 @@
 {% macro amount_pair(total, requested) -%}
 <dl class="amount-pair">
   <div><dt>그룹 월 누계</dt><dd>{{ money(total) }}<small>원</small></dd></div>
-  <div><dt>이번 승인 요청액</dt><dd>{{ money(requested) }}<small>원</small></dd></div>
+  <div><dt>이번 신규 승인 요청액</dt><dd>{{ money(requested) }}<small>원</small></dd></div>
 </dl>
 {%- endmacro %}
 {% macro links(gid) -%}

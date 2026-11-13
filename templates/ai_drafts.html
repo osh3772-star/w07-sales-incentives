@@ -29,12 +29,12 @@
       {% endif %}
       {% else %}
       {% set revisable = history|selectattr('can_resubmit')|list %}
-      {% if review or revisable %}
+      {% if review or revisable or reapprovals %}
       <form class="form-stack" method="post" action="/approvals/ai/generate" data-generates-draft>
         {{ fields() }}<input type="hidden" name="kind" value="proposal">
         {% if revisable %}
         <label>상신 대상<select name="previous_id">
-          {% if review and not pending and not supplements %}<option value="">신규 상신</option>{% endif %}
+          {% if (review or reapprovals) and not pending and not supplements %}<option value="">현재 그룹 상신</option>{% endif %}
           {% for doc in revisable %}<option value="{{ doc.approval_id }}">결재 #{{ doc.approval_id }} · 버전 {{ doc.version }} 재상신 · {{ doc.status }}</option>{% endfor %}
         </select></label>
         {% else %}<p>그룹 월 누계, 이번 승인 요청액, 연결 근거와 소명 결과로 상신 사유를 작성합니다.</p>{% endif %}
@@ -57,6 +57,7 @@
     </summary>
     <div class="draft-body">
       <p class="item-meta">생성 · {{ draft.provider }} / {{ draft.model }} · {{ role_label(draft.created_by) }} · {{ time(draft.created_at) }}</p>
+      {% if draft.review_required %}<p class="attention">초안 근거 재검토 필요 · 정정 #{{ draft.correction_ids|join(', #') }} · 생성 당시 그룹 {{ draft.group_id }}</p>{% endif %}
       {% if draft.previous_id %}<p class="item-meta">재상신 대상 · 결재 #{{ draft.previous_id }}</p>{% endif %}
       {% if draft.adopted_at %}
       <div class="draft-adopted">
@@ -72,7 +73,7 @@
         <summary>AI 생성 원문 <i class="chevron"></i></summary>
         <p class="draft-text">{{ draft.original_text }}</p>
       </details>
-      {% if team and not draft.adopted_at %}
+      {% if team and not draft.adopted_at and not draft.review_required %}
       <form class="form-stack" method="post" action="/{{ section }}/ai/{{ draft.draft_id }}/adopt">
         {{ fields() }}
         {% if draft.previous_id %}<input type="hidden" name="previous_id" value="{{ draft.previous_id }}">{% endif %}

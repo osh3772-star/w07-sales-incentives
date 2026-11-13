@@ -2,7 +2,7 @@
 {% set section = 'payments' %}
 {% set title = '지급지시·대사' %}
 {% from 'work_forms.html' import money, selector, fields, feedback_box, role_label, time with context %}
-{% set states = {'held':'지급 보류','ready':'전송 준비','sent':'회신 대기','review':'대사 확인 중','failed':'지급 실패','completed':'대사 완료'} %}
+{% set states = {'held':'지급 보류','ready':'전송 준비','sent':'회신 대기','review':'대사 확인 중','failed':'지급 실패','completed':'대사 완료','reapproval':'정정 지급 보류','bank_check':'기존 은행 결과 확인','account_recheck':'수취계좌 재확인'} %}
 {% set outcomes = {'matched':'대사 완료','failed':'지급 실패','review':'대사 확인 중','unmatched':'지시 미연결','late':'추가 회신'} %}
 {% macro masked(account) -%}
   {%- if account -%}{% set compact = account|replace('-','')|replace(' ','') %}•••• {{ compact[-4:] }}{%- else -%}미확인{%- endif -%}
@@ -28,7 +28,7 @@
 {% set chosen = overview.groups|selectattr('group_id','equalto',selected_group)|first if overview else none %}
 {% set visible_orders = orders|selectattr('agency_id','in',chosen.members)|list if selected_group and chosen else orders %}
 <section class="summary pay-summary" aria-label="지급지시 요약">
-  {% for label, value in [('지급지시',visible_orders|length),('지급 보류',visible_orders|selectattr('state','equalto','held')|list|length),('대사 완료',visible_orders|selectattr('state','equalto','completed')|list|length)] %}
+  {% for label, value in [('전송 준비',visible_orders|selectattr('queue_state','equalto','ready')|list|length),('지급 보류',visible_orders|selectattr('queue_state','in',('held','reapproval','account_recheck'))|list|length),('기존 은행 결과 확인',visible_orders|selectattr('queue_state','equalto','bank_check')|list|length),('대사 완료',visible_orders|selectattr('state','equalto','completed')|list|length)] %}
   <article class="metric"><h2>{{ label }}</h2><p class="metric-value">{{ value }}<small>건</small></p></article>
   {% endfor %}
 </section>
@@ -38,17 +38,27 @@
   <details class="order">
     <summary class="order-summary">
       <span><strong>{{ order.agency_name }}</strong><span class="item-meta">{{ order.agency_id }} · {{ order.rebate_id }} · 지시 #{{ order.instruction_id }}</span></span>
-      <b class="order-amount">{{ money(order.amount_krw) }}원</b><span class="status-tag {{ order.state }}">{{ states[order.state] }}</span><i class="chevron"></i>
+      <b class="order-amount">{{ money(order.amount_krw) }}원</b><span class="status-tag {{ order.queue_state }}">{{ states[order.queue_state] }}</span><i class="chevron"></i>
     </summary>
     <div class="order-content">
       {% set src = overview.rows|selectattr('rebate_id','equalto',order.rebate_id)|first %}
-      <div class="work-heading"><h3>지급 근거</h3><a class="work-link" href="{{ url_for('approvals', month=month, group=src.group_id if src else none) }}">결재 #{{ order.approval_id }} 보기 →</a></div>
+      <div class="work-heading"><h3>지급 근거</h3><a class="work-link" href="{{ url_for('approvals', month=month, group=src.group_id if src else none, _anchor='approval-' ~ order.approval_id) }}">최초 결재 #{{ order.approval_id }} 보기 →</a></div>
+      {% if order.effective_approval_id != order.approval_id %}<p><a class="work-link" href="{{ url_for('approvals', month=month, group=src.group_id, _anchor='approval-' ~ order.effective_approval_id) }}">재승인 결재 #{{ order.effective_approval_id }}</a></p>{% endif %}
       <dl class="log">
         <dt>수취계좌</dt><dd>{{ masked(order.account) }}{% if order.evidence %} · {{ order.evidence }}{% endif %}</dd>
         {% if order.verified_by %}<dt>확인자</dt><dd>{{ role_label(order.verified_by) }} {{ time(order.verified_at) }}</dd>{% endif %}
       </dl>
-      {% if order.state == 'held' %}
-      <p class="attention">수취계좌 미확인으로 지급을 보류했습니다. 회계·자금이 별도 증빙으로 확인하면 모의 전송할 수 있습니다.</p>
+      {% for check in order.account_rechecks %}<details class="record-detail">
+        <summary>수취계좌 재확인 이력 <i class="chevron"></i></summary>
+        <dl class="log"><dt>이전 확인 · {{ role_label(check.previous_verified_by) }} {{ time(check.previous_verified_at) }}</dt><dd>{{ masked(check.previous_account) }} · {{ check.previous_evidence }}</dd>
+          <dt>다시 확인 · {{ role_label(check.verified_by) }} {{ time(check.verified_at) }}</dt><dd>{{ masked(check.account) }} · {{ check.evidence }}</dd></dl>
+      </details>{% endfor %}
+      {% if order.queue_state == 'reapproval' %}
+      <p class="attention">정정 지급 보류 · <a href="{{ url_for('approvals',month=month,group=src.group_id) }}">현재 그룹의 재승인 작업 보기</a></p>
+      {% elif order.queue_state == 'bank_check' %}
+      <p class="attention">기존 은행 결과 확인 · 시도 {{ order.latest_attempt }}의 금액·수취계좌·처리결과를 대사하세요.</p>
+      {% elif order.queue_state in ('held','account_recheck') %}
+      <p class="attention">{{ '등록계좌 정정 후 수취계좌 증빙을 다시 확인하세요.' if order.queue_state == 'account_recheck' else '수취계좌 미확인으로 지급을 보류했습니다. 회계·자금이 별도 증빙으로 확인하면 모의 전송할 수 있습니다.' }}</p>
       {% if treasury %}
       <form class="form-stack" method="post" action="/payments/{{ order.instruction_id }}/account">
         {{ fields() }}
@@ -56,7 +66,7 @@
           <label>확인 증빙<input name="evidence" required placeholder="지급 수취계좌 확인서 또는 증빙 참조번호"></label></div>
         <button class="primary">수취계좌 확인</button>
       </form>{% endif %}
-      {% elif order.state in ('ready','failed') and treasury %}
+      {% elif order.queue_state in ('ready','failed') and treasury %}
       <form method="post" action="/payments/{{ order.instruction_id }}/send" class="event-form">
         {{ fields() }}
         {% if order.state == 'failed' %}<input type="hidden" name="expected_attempt" value="{{ order.latest_attempt }}">{% endif %}
@@ -80,6 +90,18 @@
   </details>
   {% else %}<p class="empty-copy">승인된 신규 정산건의 지급지시가 없습니다.</p>{% endfor %}
 </section>
+{% set post_reviews = correction_tasks|selectattr('kind','equalto','post_review')|list %}
+{% if post_reviews %}<section class="work-card" id="post-reviews">
+  <div class="work-heading"><h2>기지급 사후 검토</h2><span class="count">대기 {{ post_reviews|selectattr('status','equalto','open')|list|length }}건</span></div>
+  {% for task in post_reviews %}<article class="history-item">
+    <div class="item-heading"><h3>{{ task.agency_id }} · {{ task.rebate_id }}</h3><span class="status-tag">{{ '검토 완료' if task.status == 'done' else '사후 검토 대기' }}</span></div>
+    <p class="item-meta">작업 #{{ task.task_id }} · 정정 #{{ task.correction_id }} · {{ money(task.rebate_amount_krw) }}원 · {% if task.instruction_id %}지급지시 #{{ task.instruction_id }}{% else %}원장상 기지급{% endif %}</p>
+    {% if task.status == 'done' %}<p>{{ task.resolution }} · {{ role_label(task.resolved_by) }} {{ time(task.resolved_at) }}</p>
+    {% elif treasury %}<form method="post" action="/payments/tasks/{{ task.task_id }}/complete" class="form-stack">
+      {{ fields() }}<label>사후 검토 결과<textarea name="note" rows="2" required></textarea></label><button class="secondary">검토 결과 기록</button>
+    </form>{% endif %}
+  </article>{% endfor %}
+</section>{% endif %}
 {% if treasury or unmatched %}<section class="work-card">
   {% if treasury %}
   <details class="record-detail plain"><summary>시도 번호로 모의 회신 입력 <i class="chevron"></i></summary>{{ reply_form() }}</details>

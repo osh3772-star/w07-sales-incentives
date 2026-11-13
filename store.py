@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ai_drafts import AI_SCHEMA
 from approvals import APPROVAL_SCHEMA
+from corrections import CORRECTION_SCHEMA
 from payments import PAYMENT_SCHEMA
 
 
@@ -66,7 +67,7 @@ def open_db(db_path):
     try:
         db.execute("PRAGMA foreign_keys = ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 3:
+        if version > 4:
             raise ValueError("더 최신 버전의 업무 DB입니다. 앱 버전을 확인하세요.")
         if version == 0:
             db.executescript(SCHEMA)
@@ -75,6 +76,8 @@ def open_db(db_path):
                              + "\nPRAGMA user_version = 2;\nCOMMIT;")
         if version < 3:
             db.executescript("BEGIN IMMEDIATE;\n" + AI_SCHEMA + "\nPRAGMA user_version = 3;\nCOMMIT;")
+        if version < 4:
+            db.executescript("BEGIN IMMEDIATE;\n" + CORRECTION_SCHEMA + "\nPRAGMA user_version = 4;\nCOMMIT;")
     except Exception:
         db.close()
         raise
