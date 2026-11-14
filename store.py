@@ -68,7 +68,7 @@ def open_db(db_path):
     try:
         db.execute("PRAGMA foreign_keys = ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 5:
+        if version > 8:
             raise ValueError("더 최신 버전의 업무 DB입니다. 앱 버전을 확인하세요.")
         if version == 0:
             db.executescript(SCHEMA)
@@ -87,6 +87,32 @@ def open_db(db_path):
             reserve_sql = funding.BANK_REVIEW_RESERVATIONS_SQL if funding.enabled(db) else ""
             db.executescript("BEGIN IMMEDIATE;\n" + amount_schema + basis_schema + BANK_REVIEW_SCHEMA + reserve_sql
                              + "\nPRAGMA user_version = 5;\nCOMMIT;")
+        if version < 6:
+            from amount_reviews import MIXED_APPROVAL_SCHEMA
+            db.executescript("BEGIN IMMEDIATE;\n" + MIXED_APPROVAL_SCHEMA + "\nPRAGMA user_version = 6;\nCOMMIT;")
+        if version < 7:
+            from funding import migrate_debit_evidence
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("PRAGMA user_version").fetchone()[0] < 7:
+                    migrate_debit_evidence(db)
+                    db.execute("PRAGMA user_version = 7")
+        if version < 8:
+            from amount_reviews import AGENCY_REVIEW_SCHEMA
+            from monthly_basis import PAYEE_SCHEMA
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("PRAGMA user_version").fetchone()[0] < 8:
+                    for statement in AGENCY_REVIEW_SCHEMA:
+                        db.execute(statement)
+                    db.execute(PAYEE_SCHEMA)
+                    if "payee_agency_id" not in {r["name"] for r in db.execute("PRAGMA table_info(mock_payment_attempts)")}:
+                        db.execute("ALTER TABLE mock_payment_attempts ADD COLUMN payee_agency_id TEXT REFERENCES agencies")
+                    db.execute("""UPDATE mock_payment_attempts SET payee_agency_id=(
+                                      SELECT i.agency_id FROM payment_instructions i
+                                      WHERE i.instruction_id=mock_payment_attempts.instruction_id)
+                                  WHERE payee_agency_id IS NULL""")
+                    db.execute("PRAGMA user_version = 8")
     except Exception:
         db.close()
         raise

@@ -112,7 +112,7 @@ def resolve_case(db, actor, case_id, reason):
 
 def _case_records(db, month):
     return [dict(row) for row in db.execute(
-        """SELECT e.*,r.agency_id,r.period_ym FROM explanations e JOIN rebates r USING(rebate_id)
+        """SELECT e.*,r.agency_id,r.period_ym FROM explanations e JOIN effective_rebates r USING(rebate_id)
            WHERE r.period_ym=? ORDER BY case_id DESC""", (month,),
     )]
 
@@ -213,9 +213,30 @@ def _evidence(db, month, group_id, reopen_id=None, *, require_resolved=True):
     if require_resolved and any(r["rebate_id"] in source_issues and r["group_id"] == group_id
                                 for r in overview["rows"]):
         raise ValueError("같은 그룹·월의 원본 확인 작업을 먼저 해소하고 최신 명세로 상신하세요.")
+    if require_resolved and group_id in overview["dispute_reasons"]:
+        raise ValueError(overview["dispute_reasons"][group_id])
     tasks = _registration_tasks(db, month)
     changed = {r["rebate_id"]:r for r in monthly_basis.open_orders(db, month, group_id, overview=overview)
                if r["queue_kind"] == "reapproval"}
+    approval_checks = {}
+    for check in db.execute(
+        """SELECT d.rebate_id,d.decision_id,d.confirmed_amount,d.reason,c.evidence FROM amount_decisions d
+           JOIN amount_approval_checks c USING(decision_id) JOIN rebates r USING(rebate_id)
+           WHERE r.period_ym=? ORDER BY d.decision_id""", (month,),
+    ):
+        approval_checks.setdefault(check["rebate_id"], []).append(
+            f"금액 판단 #{check['decision_id']} · 확정 {check['confirmed_amount']:,}원 · {check['reason']}"
+            f" · 승인 근거 대조 {check['evidence']}"
+        )
+    for choice in db.execute(
+        """SELECT d.*,c.previous_agency_id,c.confirmed_agency_id FROM amount_agency_decisions c
+           JOIN amount_decisions d USING(decision_id) JOIN rebates r USING(rebate_id)
+           WHERE r.period_ym=? ORDER BY d.decision_id""", (month,),
+    ):
+        approval_checks.setdefault(choice["rebate_id"], []).append(
+            f"수취 대리점 판단 #{choice['decision_id']} · {choice['previous_agency_id']} → "
+            f"{choice['confirmed_agency_id']} · {choice['confirmed_amount']:,}원 · {choice['reason']}"
+        )
     lines = []
     for row in overview["rows"]:
         if row["group_id"] != group_id:
@@ -227,7 +248,8 @@ def _evidence(db, month, group_id, reopen_id=None, *, require_resolved=True):
         if kind:
             lines.append({
                 "rebate_id": row["rebate_id"], "agency_id": row["agency_id"], "amount": row["amount"],
-                "kind": kind, "notes": row["notes"], "source_status": row["source_status"],
+                "kind": kind, "notes": row["notes"] + approval_checks.get(row["rebate_id"], []),
+                "source_status": row["source_status"],
                 "source_approver": row["source_approver"], "payment_date": row["payment_date"],
                 "intake_at": row["intake_at"],
             })

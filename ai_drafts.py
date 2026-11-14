@@ -125,6 +125,9 @@ def _scope(db, month, group_id, kind, rebate_id, previous_id):
                    "has_evidence": bool(c["evidence"])} for c in cases],
         "review_memos": [{"id": m["draft_id"], "text": mask(m["text"])} for m in memos],
     }
+    if "disputed_range" in group:
+        context["unresolved_monthly_range_krw"] = list(group["disputed_range"])
+        context["authority"] = group["authority"]
     notices = _applicable_corrections(db, month, group["members"])
     if notices:
         context["registration_changes"] = notices

@@ -31,6 +31,7 @@
   <div class="work-heading"><div><h2>월 누계와 승인 요청액</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
     <a class="work-link" href="{{ url_for('cases', month=month, group=selected_group) }}">관련자·소명 보기 →</a></div>
   {{ amount_pair(chosen.total, chosen.review_amount) }}
+  {% if chosen.disputed_range %}<p class="attention">{{ overview.dispute_reasons[chosen.group_id] }} 승인권자 {{ chosen.authority }}</p>{% endif %}
   {% if reapprovals %}<p class="attention">근거 변경 후 재승인 대상 {{ reapproval_lines|length }}건 · <b>{{ money(reapproval_lines|sum(attribute='rebate_amount_krw')) }}원</b> · {{ chosen.authority }} 재상신</p>
   <p class="item-meta">{% for task in reapproval_lines %}{{ task.rebate_id }}{% if task.instruction_id %} · 기존 지급지시 #{{ task.instruction_id }}{% endif %}{% if not loop.last %} / {% endif %}{% endfor %}</p>{% endif %}
   <div class="fact-strip"><span>기지급 <strong>{{ money(chosen.paid_amount) }}원</strong></span><span>승인 후 미집행 <strong>{{ money(chosen.approved_amount) }}원</strong></span><span>접수 대기 <strong>{{ money(chosen.pending_amount) }}원</strong></span></div>

@@ -295,7 +295,7 @@ def check_dispatch(db, instruction_id):
             raise ValueError("대사한 회사 잔액, 전액 자금 배정 및 지급예정일 도래를 확인하세요.")
 
 
-def invalidate_amount_reservation(db, actor, instruction_id):
+def invalidate_amount_reservation(db, actor, instruction_id, *, payee_changed=False):
     """Release the previously reserved sum inside the reapproval transaction."""
     if not enabled(db):
         return
@@ -308,7 +308,46 @@ def invalidate_amount_reservation(db, actor, instruction_id):
     ).fetchone()
     if plan:
         db.execute("UPDATE cash_plans SET reserved=0 WHERE instruction_id=?", (instruction_id,))
-        _event(db, actor, plan, "release", "재승인 금액 변경으로 기존 배정 해제", plan["due_date"])
+        reason = "수취 대리점 변경으로 기존 배정 해제" if payee_changed else "재승인 금액 변경으로 기존 배정 해제"
+        _event(db, actor, plan, "release", reason, plan["due_date"])
+
+
+def set_debit_evidence(db, instruction_id, review_id, success_reply):
+    """Relink an existing debit in the same transaction as its treasury decision."""
+    if not db.in_transaction:
+        raise RuntimeError("모의 출금 근거와 회계 결정은 함께 저장해야 합니다.")
+    if not enabled(db):
+        return
+    debit = db.execute("SELECT reply_id FROM cash_mock_debits WHERE instruction_id=?",
+                       (instruction_id,)).fetchone()
+    if debit is None:
+        raise ValueError("지급 완료 지시의 기존 모의 출금 기록을 확인하세요.")
+    if debit["reply_id"] == success_reply:
+        return
+    db.execute("INSERT INTO debit_evidence_changes(review_id,previous_reply_id) VALUES(?,?)",
+               (review_id, debit["reply_id"]))
+    db.execute("UPDATE cash_mock_debits SET reply_id=? WHERE instruction_id=?",
+               (success_reply, instruction_id))
+
+
+def migrate_debit_evidence(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS debit_evidence_changes (
+                      review_id INTEGER PRIMARY KEY REFERENCES bank_result_reviews,
+                      previous_reply_id TEXT NOT NULL REFERENCES mock_bank_replies
+                  )""")
+    if not enabled(db):
+        return
+    # A nonpayment decision retires that debit. Only replay decisions for the active one.
+    reviews = db.execute(
+        """SELECT b.instruction_id, b.review_id, b.success_reply
+           FROM bank_result_reviews b JOIN cash_mock_debits d USING(instruction_id)
+           WHERE b.decision='completed' AND b.review_id > COALESCE((
+               SELECT MAX(old.review_id) FROM bank_result_reviews old
+               WHERE old.instruction_id=b.instruction_id AND old.decision='retry'
+           ),0) ORDER BY b.review_id"""
+    ).fetchall()
+    for review in reviews:
+        set_debit_evidence(db, review["instruction_id"], review["review_id"], review["success_reply"])
 
 
 def reverse_mock_debit(db, actor, instruction_id, review_id):

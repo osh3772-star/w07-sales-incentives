@@ -114,7 +114,7 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
         applications = {
             row["rebate_id"]: row for row in db.execute(
                 """SELECT l.rebate_id, a.approval_id, a.status, p.state AS payment_state,
-                          p.amount_krw AS payment_amount
+                          p.amount_krw AS payment_amount,p.agency_id AS paid_agency
                    FROM approvals a JOIN approval_lines l USING (approval_id)
                    LEFT JOIN payment_instructions p ON p.rebate_id=l.rebate_id
                    WHERE a.period_ym=? AND l.kind='new' ORDER BY a.approval_id""",
@@ -136,6 +136,11 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
                 (month,),
             )
         ]
+        amount_conflicts = db.execute(
+            """SELECT DISTINCT c.rebate_id,c.source_agency_id,c.reported_agency_id,c.amount
+               FROM source_amount_conflicts c JOIN open_intake_issues u
+               USING(rebate_id,period_ym,observed_row) WHERE c.period_ym=? ORDER BY c.rebate_id""", (month,),
+        ).fetchall()
     finally:
         db.execute("RELEASE overview_snapshot")
 
@@ -161,11 +166,15 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
     received_count = 0
     for rebate in rebates:
         agency_id = rebate["agency_id"]
+        application = applications.get(rebate["rebate_id"])
+        if application and application["payment_state"] == "completed":
+            agency_id = application["paid_agency"]
+        elif rebate["approval_status"] == "승인" and clean_text(rebate["payment_date"]):
+            agency_id = rebate["source_agency_id"]
         agency = registry.get(agency_id)
         eligible = bool(agency and agency["rebate_eligible"])
         reasons = issues_by_id[rebate["rebate_id"]]
         bucket, state = _settlement_state(rebate, eligible, reasons)
-        application = applications.get(rebate["rebate_id"])
         if application:
             decision = application["status"]
             if decision == "승인":
@@ -224,10 +233,40 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
             "notes": notes,
         })
 
+    # Each disputed ID still has one booked amount. Compare alternatives in the
+    # affected month/group without adding a second obligation to the ledger.
+    rows_by_id = {row["rebate_id"]: row for row in rows}
+    alternatives = {}
+    for conflict in amount_conflicts:
+        row = rows_by_id[conflict["rebate_id"]]
+        if row["state"] in ("반려", "취소"):
+            continue
+        booked_group = row["group_id"]
+        incoming_group = membership.get(conflict["reported_agency_id"])
+        for gid in {booked_group, incoming_group}:
+            if gid not in groups:
+                continue
+            by_rebate = alternatives.setdefault(gid, {})
+            included = row["amount"] if gid == booked_group and row["bucket"] else 0
+            incoming = conflict["amount"] if gid == incoming_group else 0
+            by_rebate.setdefault(row["rebate_id"], {0}).add(incoming - included)
+    dispute_reasons = {}
     for group in groups.values():
         group["total"] = group["paid_amount"] + group["approved_amount"] + group["review_amount"]
         group["projected_total"] = group["total"] + group["pending_amount"]
-        group["authority"] = authority_for(group["projected_total"]) if group["included_count"] else "—"
+        by_rebate = alternatives.get(group["group_id"])
+        if by_rebate:
+            total = group["projected_total"]
+            low = total + sum(min(deltas) for deltas in by_rebate.values())
+            high = total + sum(max(deltas) for deltas in by_rebate.values())
+            group["authority"] = authority_for(low) if authority_for(low) == authority_for(high) else "확정 대기"
+            group["disputed_range"] = (low, high)
+            dispute_reasons[group["group_id"]] = (
+                f"{', '.join(by_rebate)} 원본 미확정 · 그룹 월 누계 후보 {low:,}원 ~ {high:,}원. "
+                "월 정산 접수에서 대리점과 금액을 확인하세요."
+            )
+        else:
+            group["authority"] = authority_for(group["projected_total"]) if group["included_count"] else "—"
     for row in rows:
         group = groups.get(row["group_id"])
         row["group_total"] = group["projected_total"] if group else 0
@@ -245,4 +284,5 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
         "executive_group_count": sum(group["authority"] == "영업임원" for group in active_groups),
         "issue_count": len(issues), "check_count": sum(row["needs_check"] for row in rows),
     }
-    return {"month": month, "rows": rows, "groups": list(groups.values()), "stats": stats, "issues": issues}
+    return {"month": month, "rows": rows, "groups": list(groups.values()), "stats": stats, "issues": issues,
+            "dispute_reasons": dispute_reasons}

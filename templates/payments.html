@@ -58,6 +58,10 @@
         <dt>수취계좌</dt><dd>{{ masked(order.account) }}{% if order.evidence %} · {{ order.evidence }}{% endif %}</dd>
         {% if order.verified_by %}<dt>확인자</dt><dd>{{ role_label(order.verified_by) }} {{ time(order.verified_at) }}</dd>{% endif %}
       </dl>
+      {% for change in order.payee_changes %}<p class="item-meta">재승인 #{{ change.reapproval_id }} · 지급 대리점
+        {{ change.previous_agency_id }} → {{ change.agency_id }}{% if change.previous_account %}
+        · 이전 확인 계좌 {{ masked(change.previous_account) }} · {{ change.previous_evidence }} ·
+        {{ role_label(change.previous_verified_by) }} {{ time(change.previous_verified_at) }}{% endif %}</p>{% endfor %}
       {% for check in order.account_rechecks %}<details class="record-detail">
         <summary>수취계좌 재확인 이력 <i class="chevron"></i></summary>
         <dl class="log"><dt>이전 확인 · {{ role_label(check.previous_verified_by) }} {{ time(check.previous_verified_at) }}</dt><dd>{{ masked(check.previous_account) }} · {{ check.previous_evidence }}</dd>
@@ -76,6 +80,7 @@
       {% if treasury %}
       <form class="form-stack" method="post" action="/payments/{{ order.instruction_id }}/account">
         {{ fields() }}
+        <input type="hidden" name="expected_agency_id" value="{{ order.agency_id }}">
         <div class="input-pair"><label>확인한 수취계좌<input name="account" required placeholder="증빙의 은행명과 계좌번호"></label>
           <label>확인 증빙<input name="evidence" required placeholder="지급 수취계좌 확인서 또는 증빙 참조번호"></label></div>
         <button class="primary">수취계좌 확인</button>
@@ -99,6 +104,8 @@
           <span>{{ reply.reason }} · {{ time(reply.received_at) }}</span>
         </li>{% endfor %}
       </ul>{% endif %}
+      {% if order.debit %}<p>현재 모의 출금 <strong>{{ money(order.debit.amount) }}원</strong> · {{ order.debit.paid_on }}
+        · 출금 근거 {{ order.debit.sequence_no }}차 성공 회신 <strong>{{ order.debit.reply_id }}</strong></p>{% endif %}
       {% if order.bank_conflict %}
       <p class="attention">은행 회신 상충 · 모든 전송 시도의 결과와 실제 출금 여부를 확인할 때까지 추가 전송을 보류합니다.</p>
       {% if treasury %}<form class="form-stack" method="post" action="/payments/{{ order.instruction_id }}/bank-review">
@@ -114,7 +121,8 @@
       </form>{% endif %}{% endif %}
       {% for review in order.bank_reviews if review.decision %}<p class="item-meta">회계 확인 #{{ review.review_id }} ·
         {{ '지급 완료' if review.decision == 'completed' else '모든 시도 미지급 확인' }}
-        {% if review.success_reply %} · {{ review.success_reply }}{% endif %}
+        {% if review.previous_reply_id %} · 출금 근거 변경 {{ review.previous_reply_id }} → {{ review.success_reply }}
+        {% elif review.success_reply %} · {{ review.success_reply }}{% endif %}
         · {{ review.evidence }} · {{ role_label(review.reviewed_by) }} {{ time(review.reviewed_at) }}</p>{% endfor %}
       {% if order.state in ('sent','review') and treasury %}
       <div class="event-form"><h3 class="subheading">모의 은행 회신 입력</h3>{{ reply_form(order) }}</div>

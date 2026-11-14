@@ -7,6 +7,7 @@
 {% macro path_tag(authority) -%}
   {% if authority == '영업임원' %}<span class="tag executive">영업임원</span>
   {% elif authority == '영업지원팀' %}<span class="tag team">영업지원팀</span>
+  {% elif authority == '확정 대기' %}<span class="muted">승인권자 확정 대기</span>
   {% else %}<span class="muted">—</span>{% endif %}
 {%- endmacro %}
 {% macro breakdown(group) -%}
@@ -78,7 +79,8 @@
       <div><h3>직접 연결 근거</h3>
       <ul class="edges">{% for edge in group.edges %}<li><b>{{ edge.left }} ↔ {{ edge.right }}</b> {{ edge['keys']|join(' · ') }} 일치</li>{% endfor %}</ul>{{ links(group.group_id) }}</div>
       <div><h3>월 누계 구성</h3>{{ breakdown(group) }}
-      <p class="applied">현재 반영된 누계 <strong>{{ money(group.total) }}원</strong></p></div>
+      <p class="applied">현재 반영된 누계 <strong>{{ money(group.total) }}원</strong></p>
+      {% if group.disputed_range %}<p>입력 후보에 따른 월 누계 범위 {{ money(group.disputed_range[0]) }}원 ~ {{ money(group.disputed_range[1]) }}원</p>{% endif %}</div>
     </div>
   </details>
   {% endfor %}
@@ -91,14 +93,16 @@
   {% for review in amount_reviews %}
   <details class="record-detail" {% if review.open %}open{% endif %}>
     <summary>{{ review.rebate_id }} · {{ '금액 확인 대기' if review.open else '금액 판단 이력' }}</summary>
-    <p>최초 원장 {{ money(review.original) }}원 · 현재 심사 기준 {{ money(review.effective) }}원</p>
+    <p>최초 원장 {{ money(review.original) }}원 · {{ review.source_agency_id }} · 현재 심사 기준 {{ money(review.effective) }}원 · {{ review.effective_agency_id }}</p>
     {% if review.paid is not none and review.paid != review.effective %}
     <p class="attention">기지급 기록 {{ money(review.paid) }}원과 확정액에 차이가 있습니다. 회계에서 지급 증빙을 대조하세요. 기존 지급 건은 월 누계에 기지급액으로 반영됩니다.</p>
     {% endif %}
     <ul>
       {% for entry in review.inputs %}
       <li>추가 입력 {{ money(entry.amount) }}원 · {{ '확인 대기' if entry.decision_id is none else '판단 #' ~ entry.decision_id }}
+        · {{ entry.reported_agency_id }}
         {% if entry.original_sales != entry.reported_sales %} · 매출 실적 {{ money(entry.original_sales) }}원 → {{ money(entry.reported_sales) }}원{% endif %}
+        {% if entry.approval_changed %} · 원본 승인 표기 {{ entry.original_status }} / {{ entry.original_approver }} → 추가 입력 표기 {{ entry.reported_status }} / {{ entry.reported_approver }}{% endif %}
       </li>
       {% endfor %}
     </ul>
@@ -106,14 +110,24 @@
     <form method="post" action="/intake/{{ review.rebate_id|urlencode }}/resolve-amount" class="form-stack">
       {{ fields() }}
       <input type="hidden" name="expected_input" value="{{ review.inputs|length }}">
+      {% if review.candidate_agencies|length > 1 %}
+      <label>확정 대리점<select name="confirmed_agency_id" required><option value="">증빙과 일치하는 대리점 선택</option>
+        {% for agency in review.candidate_agencies|sort %}<option value="{{ agency }}">{{ agency }}</option>{% endfor %}</select></label>
+      {% endif %}
       <label>확정 금액(원)<input type="number" name="amount" min="0" step="1" required></label>
       <label>판단 근거<textarea name="reason" required></textarea></label>
+      {% if review.needs_approval_check %}
+      {% set line = overview.rows|selectattr('rebate_id','equalto',review.rebate_id)|first %}
+      <p>추가 입력의 승인 표기만으로는 지급할 수 없습니다. <a href="{{ url_for('approvals',month=month,group=line.group_id) }}">이 그룹의 실제 결재 기록 확인</a></p>
+      <label>승인 표기와 실제 결재 기록을 대조한 근거<textarea name="approval_evidence" required></textarea></label>
+      {% endif %}
       <button class="secondary">확정 금액 기록</button>
     </form>
     {% endif %}
     {% for decision in review.decisions %}
     <p>판단 #{{ decision.decision_id }} · {{ money(decision.previous_amount) }}원 → {{ money(decision.confirmed_amount) }}원
-       · {{ decision.reason }} · {{ role_label(decision.decided_by) }} · {{ time(decision.decided_at) }}</p>
+       {% if decision.confirmed_agency_id %} · 대리점 {{ decision.previous_agency_id }} → {{ decision.confirmed_agency_id }}{% endif %}
+       · {{ decision.reason }}{% if decision.approval_evidence %} · 승인 근거 대조 {{ decision.approval_evidence }}{% endif %} · {{ role_label(decision.decided_by) }} · {{ time(decision.decided_at) }}</p>
     {% endfor %}
   </details>
   {% endfor %}

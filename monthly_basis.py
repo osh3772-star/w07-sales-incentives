@@ -16,6 +16,16 @@ CREATE TABLE IF NOT EXISTS payment_basis_reviews (
 );
 """
 
+PAYEE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS payment_payee_changes (
+    instruction_id INTEGER NOT NULL REFERENCES payment_instructions,
+    reapproval_id INTEGER NOT NULL REFERENCES approvals,
+    previous_agency_id TEXT NOT NULL REFERENCES agencies, agency_id TEXT NOT NULL REFERENCES agencies,
+    previous_account TEXT, previous_evidence TEXT, previous_verified_by TEXT, previous_verified_at TEXT,
+    PRIMARY KEY(instruction_id,reapproval_id)
+)
+"""
+
 
 def _financial_scope(group, lines):
     # A normal transition from review to approved or paid doesn't add another obligation.
@@ -49,14 +59,6 @@ def _orders(db, month, group_id=None, *, overview=None):
     )}
     rows = {r["rebate_id"]: r for r in view["rows"]}
     scopes = {}
-    disputed_ids = {r["rebate_id"] for r in db.execute(
-        """SELECT DISTINCT i.rebate_id FROM amount_inputs i JOIN open_intake_issues u
-           ON u.rebate_id=i.rebate_id AND u.observed_row=i.observed_row WHERE i.period_ym=?""", (month,),
-    )}
-    group_disputes = {}
-    for rid in sorted(disputed_ids):
-        if rid in rows and rows[rid]["state"] not in ("반려", "취소"):
-            group_disputes.setdefault(rows[rid]["group_id"], []).append(rid)
     for group in view["groups"]:
         gid = group["group_id"]
         if group_id is None or gid == group_id:
@@ -79,9 +81,8 @@ def _orders(db, month, group_id=None, *, overview=None):
         reason = None
         kind = None
         amount_hold = None
-        if order["state"] != "completed" and gid in group_disputes:
-            amount_hold = ("그룹 월 누계에 포함할 금액이 미확정입니다. 월 정산 접수에서 "
-                           + ", ".join(group_disputes[gid]) + "의 원본 금액을 확인하세요.")
+        if order["state"] != "completed":
+            amount_hold = view["dispute_reasons"].get(gid)
         if order["state"] != "completed" and (changed or outstanding):
             if order["state"] in ("sent", "review"):
                 kind = "bank_check"
@@ -161,6 +162,21 @@ def authorize(db, actor, approval_id, lines):
         ).rowcount
         if updated != 1:
             raise ValueError("재승인 근거가 바뀌었습니다. 최신 명세로 다시 상신하세요.")
-        if order["amount_krw"] != line["amount"]:
-            funding.invalidate_amount_reservation(db, actor, iid)
+        payee_changed = order["agency_id"] != line["agency_id"]
+        if payee_changed or order["amount_krw"] != line["amount"]:
+            funding.invalidate_amount_reservation(db, actor, iid, payee_changed=payee_changed)
             db.execute("UPDATE payment_instructions SET amount_krw=? WHERE instruction_id=?", (line["amount"], iid))
+        if payee_changed:
+            db.execute(
+                """INSERT INTO payment_payee_changes
+                   (instruction_id,reapproval_id,previous_agency_id,agency_id,previous_account,previous_evidence,
+                    previous_verified_by,previous_verified_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (iid, approval_id, order["agency_id"], line["agency_id"], order["account"], order["evidence"],
+                 order["verified_by"], order["verified_at"]),
+            )
+            db.execute(
+                """UPDATE payment_instructions SET agency_id=?, account=NULL, evidence=NULL,
+                   verified_by=NULL, verified_at=NULL, state=CASE WHEN state='failed' THEN 'failed' ELSE 'held' END
+                   WHERE instruction_id=?""", (line["agency_id"], iid),
+            )

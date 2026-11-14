@@ -14,6 +14,8 @@ from approvals import decide_approval, submit_approval
 from corrections import apply_correction
 from payments import confirm_account, list_payments, record_reply, resolve_bank_review, send_mock
 from store import create_funding_database, open_db, receive_month, sync_sources
+from test_intake import running_server
+from test_workflow_http import Session
 from workflow_security import USERS
 
 
@@ -314,6 +316,67 @@ class FundingLedgerTest(unittest.TestCase):
         second = send_mock(self.db, TREASURY, iid, first)
         record_reply(self.db, TREASURY, "재송금 성공", second, amount, ACCOUNT, "success")
         self.assertEqual(self.db.execute("SELECT sum(amount) FROM cash_mock_debits").fetchone()[0], amount)
+
+    def test_treasury_changes_completed_debit_to_first_success_without_another_withdrawal(self):
+        iid = self.db.execute(
+            "SELECT instruction_id FROM payment_instructions WHERE agency_id='D-011'"
+        ).fetchone()[0]
+        amount = 1_373_515
+        self.baseline(3_000_000)
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "D-011 수취계좌 확인서")
+        funding.allocate(self.db, TREASURY, DAY)
+        first = send_mock(self.db, TREASURY, iid)
+        record_reply(self.db, TREASURY, "F1", first, amount, ACCOUNT, "failure")
+        second = send_mock(self.db, TREASURY, iid, first)
+        record_reply(self.db, TREASURY, "S2", second, amount, ACCOUNT, "success")
+        debit_query = "SELECT reply_id,amount,paid_on,balance_id FROM cash_mock_debits WHERE instruction_id=?"
+        initial = self.db.execute(debit_query, (iid,)).fetchone()
+        self.assertEqual(initial["reply_id"], "S2")
+        self.assertEqual(self.balance(), (1_626_485, 1_189_046, 437_439, 888_097))
+
+        # The next bank closing balance already includes the original withdrawal.
+        self.baseline(1_626_485, "2026-07-14")
+        record_reply(self.db, TREASURY, "S1", first, amount, ACCOUNT, "success")
+        order = next(row for row in list_payments(self.db, "2026-06")["orders"] if row["instruction_id"] == iid)
+        self.assertTrue(order["bank_conflict"])
+        reply_history = self.db.execute("SELECT * FROM mock_bank_replies ORDER BY rowid").fetchall()
+        self.assertEqual([(r["reply_id"], r["attempt_id"]) for r in reply_history],
+                         [("F1", first), ("S2", second), ("S1", first)])
+        consume = "SELECT * FROM cash_plan_events WHERE instruction_id=? AND action='consume'"
+        original_events = self.db.execute(consume, (iid,)).fetchall()
+        self.assertEqual(len(original_events), 1)
+        self.assertIn("S2", original_events[0]["reason"])
+        evidence = "은행 거래조회서로 1차만 출금됐음을 대조"
+        decision = dict(decision="completed", evidence=evidence, reply_version=order["reply_version"], success_reply="S1")
+        url = f"/payments/{iid}/bank-review"
+        self.assertEqual(self.treasury_post(url, **decision).status_code, 200)
+        self.assertEqual(self.db.execute(debit_query, (iid,)).fetchone()["reply_id"], "S1")
+        with running_server(self.path) as restarted_url:
+            restarted = Session(restarted_url)
+            self.assertEqual(restarted.post("/identity", user_id="treasury", next="/")[0], 200)
+            self.assertEqual(restarted.post(url, **decision)[0], 200)
+            self.assertEqual(restarted.post(url, **{**decision, "success_reply": "S2"})[0], 400)
+            status, page = restarted.get("/payments?month=2026-06&group=D-011")
+            self.assertEqual(status, 200)
+            self.assertIn("현재 모의 출금 <strong>1,373,515원</strong>", page)
+            self.assertIn("출금 근거 1차 성공 회신 <strong>S1</strong>", page)
+            self.assertIn("출금 근거 변경 S2 → S1", page)
+            self.assertIn(evidence, page)
+        with closing(open_db(self.path)) as reopened:
+            debits = reopened.execute(debit_query, (iid,)).fetchall()
+            self.assertEqual([tuple(row) for row in debits], [("S1", amount, initial["paid_on"], initial["balance_id"])])
+            self.assertEqual(reopened.execute(consume, (iid,)).fetchall(), original_events)
+            self.assertEqual(reopened.execute("SELECT * FROM mock_bank_replies ORDER BY rowid").fetchall(), reply_history)
+            reviews = reopened.execute(
+                """SELECT c.previous_reply_id,b.success_reply,b.reviewed_by,b.evidence,b.reviewed_at
+                   FROM bank_result_reviews b LEFT JOIN debit_evidence_changes c USING(review_id)
+                   WHERE b.instruction_id=?""", (iid,),
+            ).fetchall()
+            self.assertEqual([tuple(row[:4]) for row in reviews], [("S2", "S1", TREASURY.user_id, evidence)])
+            self.assertTrue(reviews[0]["reviewed_at"])
+            self.assertEqual(reopened.execute("SELECT count(*) FROM reversed_mock_debits").fetchone()[0], 0)
+            book = funding.overview(reopened)
+            self.assertEqual((book["confirmed"], book["reserved"], book["free"]), (1_626_485, 1_189_046, 437_439))
 
     def test_prior_amount_success_cannot_complete_reapproved_larger_order(self):
         version = submit_approval(self.db, STAFF, "2026-06", "D-001", "단건 전결")

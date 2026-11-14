@@ -244,7 +244,7 @@ def create_app(database=None, source_root=SOURCE_ROOT):
     def resolve_rebate_amount(rebate_id):
         with closing(open_db(db_path)) as db:
             amount_reviews.resolve_amount(db, actor(), rebate_id, form("amount"), form("reason"),
-                                          number("expected_input"))
+                                          number("expected_input"), form("approval_evidence"), form("confirmed_agency_id"))
         return success("확정 금액과 판단 근거를 저장했습니다. 결재와 지급 상태를 확인하세요.", "index")
 
     @app.post("/cases/request")
@@ -340,7 +340,8 @@ def create_app(database=None, source_root=SOURCE_ROOT):
     @app.post("/payments/<int:instruction_id>/account")
     def confirm_account(instruction_id):
         with closing(open_db(db_path)) as db:
-            settlement.confirm_account(db, actor(), instruction_id, form("account"), form("evidence"))
+            settlement.confirm_account(db, actor(), instruction_id, form("account"), form("evidence"),
+                                       form("expected_agency_id"))
         return success(f"지급지시 #{instruction_id}의 수취계좌와 확인 근거를 기록했습니다.")
 
     @app.post("/payments/<int:instruction_id>/send")
