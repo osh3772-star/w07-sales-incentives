@@ -20,9 +20,8 @@
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="month" value="{{ month or '' }}">
       <input type="hidden" name="group" value="{{ selected_group or '' }}">
-      <input type="hidden" name="next" value="{{ url_for(section) }}">
-      <label for="demo-user">시연 사용자</label>
-      <select id="demo-user" name="user_id">
+      <input type="hidden" name="next" value="{{ identity_next|default(url_for(section)) }}">
+      <select id="demo-user" name="user_id" aria-label="담당자 선택">
         {% for user in users %}<option value="{{ user.user_id }}"{% if user.user_id == actor.user_id %} selected{% endif %}>{{ user.label }}</option>{% endfor %}
       </select>
       <noscript><button type="submit">전환</button></noscript>

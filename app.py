@@ -10,18 +10,21 @@ from flask import Flask, flash, get_flashed_messages, redirect, render_template,
 import ai_drafts
 import approvals as decisions
 import corrections
+import funding
+import funding_ai
 import payments as settlement
 from ai_provider import ProviderError
 from rules import effective_agencies, month_overview
-from store import available_months, open_db, receive_month, sync_sources
+from store import available_months, create_funding_database, open_db, receive_month, sync_sources
 from workflow_security import USERS, require_role
 
 
 ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = ROOT / "01_참가자_배포용" / "04_원본데이터" / "01_corevia"
-SCREENS = {"/": "index", "/cases": "cases", "/approvals": "approvals", "/payments": "payments"}
+SCREENS = {"/": "index", "/cases": "cases", "/approvals": "approvals", "/payments": "payments",
+           "/payments/plan": "payment_plan"}
 TEMPLATES = {"index": "intake.html", "cases": "cases.html", "approvals": "approvals.html",
-             "payments": "payments.html"}
+             "payments": "payments.html", "payment_plan": "funding.html"}
 AI_KINDS = {"cases": ("summary", "question"), "approvals": ("proposal",)}
 
 
@@ -76,6 +79,16 @@ def create_app(database=None, source_root=SOURCE_ROOT):
                                         if group in doc["visible_groups"]]
             if screen == "payments":
                 details.update(settlement.list_payments(db, month))
+                details["funding_enabled"] = funding.enabled(db)
+                if details["funding_enabled"]:
+                    funding_plan = funding.overview(db)
+                    details["funding_dispatch"] = {row["instruction_id"]: row["funds_ready"]
+                                                   for row in funding_plan["lines"]}
+            if screen == "payment_plan":
+                if not funding.enabled(db):
+                    return "지급계획 전용 DB에서 열어 주세요.", 404
+                details["plan"] = funding.overview(db)
+                details["advice"] = funding_ai.list_proposals(db)
         return render_template(
             TEMPLATES[screen], month=month, months=months, group=group, selected_group=group,
             overview=overview, actor=actor(), users=USERS.values(), csrf_token=session["csrf_token"],
@@ -85,6 +98,8 @@ def create_app(database=None, source_root=SOURCE_ROOT):
     def current_screen():
         if request.path == "/identity":
             return SCREENS.get(form("next"), "index")
+        if request.path == "/payments/plan" or request.path.startswith("/payments/plan/"):
+            return "payment_plan"
         return SCREENS.get("/" + request.path.strip("/").split("/")[0], "index")
 
     @app.before_request
@@ -126,6 +141,68 @@ def create_app(database=None, source_root=SOURCE_ROOT):
     @app.get("/payments")
     def payments():
         return page("payments", request.args.get("month"), request.args.get("group"))
+
+    @app.get("/payments/plan")
+    def payment_plan():
+        return page("payment_plan", request.args.get("month"))
+
+    def number(name):
+        value = form(name)
+        if not value.isascii() or not value.isdecimal() or len(value) > 18:
+            raise ValueError("선택한 지급지시·작업 번호 또는 버전을 확인하세요.")
+        return int(value)
+
+    @app.post("/payments/plan/<action>")
+    def update_payment_plan(action):
+        with closing(open_db(db_path)) as db:
+            if not funding.enabled(db):
+                return "지급계획 전용 DB에서 열어 주세요.", 404
+            user = actor()
+            if action == "balance":
+                funding.set_balance(db, user, form("amount"), form("as_of"), form("evidence"),
+                                    form("scope"), form("restricted") or "0", form("external") or "0")
+                message = "기준 잔액과 사용 제한·타 용도 배정액을 기록했습니다."
+            elif action == "schedule":
+                funding.schedule(db, user, number("instruction_id"), form("due_date"), form("reason"),
+                                 expected_version=number("expected_version"))
+                message = "지급예정일을 저장했습니다."
+            elif action == "allocate":
+                allocated = funding.allocate(db, user, form("due_date"))
+                message = f"새로 배정한 지급지시 {len(allocated)}건입니다."
+            elif action == "release":
+                funding.release(db, user, number("instruction_id"), form("reason"),
+                                expected_reservation=number("expected_reservation"))
+                message = "배정 해제 결과를 반영했습니다."
+            elif action == "deposit":
+                if form("proposal_id"):
+                    funding_ai.confirm_funding_receipt(db, user, number("proposal_id"), form("reference"),
+                                                      form("amount"), form("received_on"), form("evidence"))
+                else:
+                    funding.confirm_receipt(db, user, form("reference"), form("amount"),
+                                            form("received_on"), form("evidence"))
+                message = "입금 확인 결과를 반영했습니다. 같은 거래는 한 번만 계산합니다."
+            elif action == "propose":
+                try:
+                    proposal = funding_ai.generate_options(db, user, number("instruction_id"),
+                                                           form("target_amount"), form("new_date"))
+                except ProviderError as exc:
+                    return page("payment_plan", form("month"), error=str(exc), status=503)
+                message = f"AI 자금 대안 #{proposal}을 저장했습니다."
+            elif action == "adopt":
+                funding_ai.adopt_option(db, user, number("proposal_id"), form("choice"), form("review_note"))
+                message = "선택한 방안을 계획에 연결했습니다. 부서 작업을 확인하세요."
+            elif action == "task":
+                decision = form("accepted")
+                if decision not in ("yes", "no"):
+                    raise ValueError("협의 결과를 선택하세요.")
+                funding_ai.respond_task(db, user, number("task_id"), decision == "yes", form("note"))
+                message = "부서 확인 결과를 기록했습니다."
+            elif action == "confirm-date":
+                funding_ai.finalize_reschedule(db, user, number("proposal_id"), form("note"))
+                message = "합의한 날짜로 변경하고 일자별 부족액을 다시 계산했습니다."
+            else:
+                return "등록되지 않은 지급계획 작업입니다.", 404
+        return success(message)
 
     @app.post("/identity")
     def identity():
@@ -272,5 +349,14 @@ def create_app(database=None, source_root=SOURCE_ROOT):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="W07 판매장려금")
     parser.add_argument("--port", type=int, default=5070)
+    parser.add_argument("--funding-db", type=Path, help="별도 지급계획 DB를 생성하거나 다시 엽니다.")
     args = parser.parse_args()
-    create_app().run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)
+    if args.funding_db:
+        path = args.funding_db.resolve()
+        if path.exists():
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as existing:
+                if not funding.enabled(existing):
+                    parser.error("기존 업무 DB입니다. 지급계획에는 새 파일 경로를 지정하세요.")
+        else:
+            create_funding_database(path)
+    create_app(database=args.funding_db).run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)

@@ -1,0 +1,85 @@
+{% set status_names = {'draft':'선택 대기','funding_pending':'입금 확인 대기','reschedule_pending':'일정 협의 중','ready_to_move':'새 예정일 확정 대기','done':'완료','declined':'협의 불가','stale':'최신 근거 재검토 필요'} %}
+{% set task_names = {'collection':'추가 자금 회수 일정 확인','negotiation':'대리점 지급일 협의','receipt':'실입금 대사','finalize':'변경 예정일 확정'} %}
+{% set task_states = {'open':'처리 대기','waiting':'선행 작업 대기','done':'완료','cancelled':'취소'} %}
+{% set candidates = namespace(lines=[]) %}
+{% set pending_ids = advice|selectattr('status','in',('funding_pending','reschedule_pending','ready_to_move'))|map(attribute='instruction_id')|list %}
+{% for d in plan.days if d.shortage %}
+  {% for line in plan.lines if line.due_date == d.due_date and not line.reserved and line.queue_state in ('held','ready','failed') and line.instruction_id not in pending_ids %}
+    {% set candidates.lines = candidates.lines + [line] %}
+  {% endfor %}
+{% endfor %}
+<section id="funding-advice" class="work-card draft-panel">
+  <div class="work-heading"><h2>부족액 대응안과 부서 작업</h2></div>
+  {% if treasury and baseline and candidates.lines %}
+    <details class="record-detail"{% if not advice %} open{% endif %}><summary>AI 대안 요청 <i class="chevron"></i></summary>
+      <form class="form-stack event-form" action="/payments/plan/propose" method="post" data-generates-draft>
+        {{ fields() }}
+        <label>검토할 미배정 지시<select name="instruction_id" required>
+          {% for line in candidates.lines %}<option value="{{ line.instruction_id }}">{{ line.due_date }} · {{ line.agency_id }} · 지시 #{{ line.instruction_id }} · {{ money(line.amount) }}원</option>{% endfor %}
+        </select></label>
+        <div class="input-pair"><label>추가 확보 목표액(원)<input type="number" name="target_amount" min="1" step="1" required></label>
+          <label>조정 후보일<input name="new_date" type="date" required></label></div>
+        <button class="primary">AI 대안 생성</button>
+        <p class="draft-progress" hidden role="status">추가 확보안과 지급일 조정안을 생성하고 있습니다.</p>
+      </form>
+    </details>
+  {% endif %}
+  {% for opt in advice %}
+  <article class="history-item" id="proposal-{{ opt.proposal_id }}">
+    <div class="item-heading"><h3>{{ opt.agency_id }} · 지급지시 #{{ opt.instruction_id }}</h3>
+      <span class="status-tag {{ 'completed' if opt.status == 'done' else '' }}">{{ status_names.get(opt.status,opt.status) }}</span></div>
+    <p class="item-meta">대안 #{{ opt.proposal_id }} · {{ opt.provider }} / {{ opt.model }} · 제안 당시 {{ opt.due_date }}까지 부족액 {{ money(opt.shortage) }}원</p>
+    {% if opt.request_id %}<details class="record-detail"><summary>모델 호출 기록 <i class="chevron"></i></summary><p class="item-meta">{{ opt.request_id }}</p></details>{% endif %}
+    <div class="funding-options">
+      {% for kind, label, body in [('funding','추가 자금 확보',opt.funding_text),('reschedule','지급일 조정',opt.reschedule_text)] %}
+      <section>
+        <h4>{{ label }}{% if opt.choice == kind %} · 채택{% endif %}</h4>
+        {% if kind == 'funding' %}
+        <p class="funding-scenario"><strong>{{ money(opt.target_amount) }}원</strong> 확보 목표</p>
+        <p class="item-meta">전액 입금 확인 시 {{ opt.due_date }}까지 부족액 {{ money(opt.funding_shortage_after_confirmation) }}원</p>
+        {% else %}
+        <p class="funding-scenario"><strong>{{ opt.due_date }} → {{ opt.new_date }}</strong></p>
+        <p class="item-meta">추가 입금 없이 이동 시 · 원래 날짜까지 부족액 {{ money(opt.old_shortage_after_move) }}원 · 새 날짜까지 부족액 {{ money(opt.new_shortage_after_move) }}원</p>
+        {% endif %}
+        <p class="draft-text">{{ body }}</p>
+        {% if opt.status == 'draft' and opt.version != plan.version %}<p class="item-meta">생성 후 지급계획이 바뀌었습니다. 현재 조건으로 대안을 다시 생성하세요.</p>
+        {% elif treasury and opt.status == 'draft' and opt.instruction_id not in pending_ids %}<form class="form-stack" method="post" action="/payments/plan/adopt">
+          {{ fields() }}<input name="proposal_id" type="hidden" value="{{ opt.proposal_id }}"><input name="choice" type="hidden" value="{{ kind }}">
+          <label>담당자 검토·수정 내용<textarea name="review_note" rows="2" required></textarea></label>
+          <button class="secondary">{{ label }}안 채택</button>
+        </form>{% endif %}
+      </section>
+      {% endfor %}
+    </div>
+    {% if opt.choice %}
+    <p class="next-action"><strong>채택한 계획</strong> · {% if opt.choice == 'funding' %}실입금 확인 {{ money(opt.received_amount) }}원 / 목표 {{ money(opt.target_amount) }}원{% else %}지시 #{{ opt.instruction_id }} · 조정 후보일 {{ opt.new_date }}{% endif %}</p>
+    <p class="draft-text">{{ opt.review_note }}</p><p class="item-meta">{{ role_label(opt.adopted_by) }} · {{ time(opt.adopted_at) }}</p>
+    {% for task in opt.tasks %}
+    <section class="funding-task" id="plan-task-{{ task.task_id }}">
+      <div class="item-heading"><h4>{{ role_label(task.owner_role) }} · {{ task_names.get(task.kind,task.kind) }}</h4>
+        <span class="status-tag">{{ task_states.get(task.status,task.status) }}</span></div>
+      <p class="item-meta">작업 #{{ task.task_id }} · {{ task.due_date|default(opt.due_date,true) }}까지</p>
+      {% if task.note %}<p class="draft-text">{{ task.note }}</p>{% endif %}
+      {% if task.resolved_by %}<p class="item-meta">{{ role_label(task.resolved_by) }} · {{ time(task.resolved_at) }}</p>{% endif %}
+      {% if task.status == 'open' and task.owner_role == 'staff' and actor.role in ('staff','lead') %}
+      <form class="form-stack" action="/payments/plan/task" method="post">
+        {{ fields() }}<input name="task_id" type="hidden" value="{{ task.task_id }}">
+        <label>확인 결과와 증빙<textarea name="note" rows="2" required></textarea></label>
+        <div class="button-row"><button name="accepted" value="yes" class="secondary">{{ '회수 일정 확인' if task.kind == 'collection' else '변경 일정 합의' }}</button>
+          <button name="accepted" value="no" class="secondary danger">{{ '회수 불가 기록' if task.kind == 'collection' else '협의 불가 기록' }}</button></div>
+      </form>
+      {% elif treasury and task.status == 'open' and task.kind == 'receipt' and opt.status == 'funding_pending' %}
+      <details class="record-detail"><summary>확보안에 실입금 연결 <i class="chevron"></i></summary>
+        <form class="form-stack" action="/payments/plan/deposit" method="post">{{ deposit_fields(opt.proposal_id) }}</form>
+      </details>
+      {% elif treasury and task.kind == 'finalize' and opt.status == 'ready_to_move' %}
+      <form class="form-stack" action="/payments/plan/confirm-date" method="post">
+        {{ fields() }}<input name="proposal_id" type="hidden" value="{{ opt.proposal_id }}">
+        <label>{{ opt.new_date }} 지급일 확정 근거<input name="note" required></label><button class="primary">새 지급예정일 확정</button>
+      </form>{% endif %}
+    </section>
+    {% endfor %}
+    {% endif %}
+  </article>
+  {% else %}<p class="empty-copy">저장된 대응안이 없습니다.</p>{% endfor %}
+</section>

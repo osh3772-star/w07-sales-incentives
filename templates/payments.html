@@ -26,6 +26,7 @@
     <h1 id="page-title">지급지시와 은행 대사</h1>
     <p>승인된 건의 수취계좌를 확인하고, 모의 은행 회신의 금액과 계좌를 지급지시와 대조합니다.</p>
   </hgroup>
+  {% if funding_enabled %}<a class="secondary" href="/payments/plan">지급계획 보기</a>{% endif %}
 </section>
 {{ feedback_box() }}
 {{ selector(section, true) }}
@@ -33,7 +34,11 @@
 {% set chosen = overview.groups|selectattr('group_id','equalto',selected_group)|first if overview else none %}
 {% set visible_orders = orders|selectattr('agency_id','in',chosen.members)|list if selected_group and chosen else orders %}
 <section class="summary pay-summary" aria-label="지급지시 요약">
-  {% for label, value in [('전송 준비',visible_orders|selectattr('queue_state','equalto','ready')|list|length),('지급 보류',visible_orders|selectattr('queue_state','in',('held','reapproval','account_recheck'))|list|length),('기존 은행 결과 확인',visible_orders|selectattr('queue_state','equalto','bank_check')|list|length),('대사 완료',visible_orders|selectattr('state','equalto','completed')|list|length)] %}
+  {% set ready = visible_orders|selectattr('queue_state','equalto','ready')|list %}
+  {% set blocked = namespace(count=0) %}
+  {% if funding_enabled %}{% for item in ready if not funding_dispatch.get(item.instruction_id) %}{% set blocked.count = blocked.count + 1 %}{% endfor %}{% endif %}
+  {% set held = visible_orders|selectattr('queue_state','in',('held','reapproval','account_recheck'))|list %}
+  {% for label, value in [('전송 준비',(ready|length) - blocked.count),('지급 보류',(held|length) + blocked.count),('기존 은행 결과 확인',visible_orders|selectattr('queue_state','equalto','bank_check')|list|length),('대사 완료',visible_orders|selectattr('state','equalto','completed')|list|length)] %}
   <article class="metric"><h2>{{ label }}</h2><p class="metric-value">{{ value }}<small>건</small></p></article>
   {% endfor %}
 </section>
@@ -43,7 +48,7 @@
   <details class="order">
     <summary class="order-summary">
       <span><strong>{{ order.agency_name }}</strong><span class="item-meta">{{ order.agency_id }} · {{ order.rebate_id }} · 지시 #{{ order.instruction_id }}</span></span>
-      <b class="order-amount">{{ money(order.amount_krw) }}원</b><span class="status-tag {{ order.queue_state }}">{{ states[order.queue_state] }}</span><i class="chevron"></i>
+      <b class="order-amount">{{ money(order.amount_krw) }}원</b>{% if funding_enabled and order.queue_state == 'ready' and not funding_dispatch.get(order.instruction_id) %}<span class="status-tag held">자금·예정일 확인</span>{% else %}<span class="status-tag {{ order.queue_state }}">{{ states[order.queue_state] }}</span>{% endif %}<i class="chevron"></i>
     </summary>
     <div class="order-content">
       {% set src = overview.rows|selectattr('rebate_id','equalto',order.rebate_id)|first %}
@@ -71,6 +76,8 @@
           <label>확인 증빙<input name="evidence" required placeholder="지급 수취계좌 확인서 또는 증빙 참조번호"></label></div>
         <button class="primary">수취계좌 확인</button>
       </form>{% endif %}
+      {% elif funding_enabled and order.queue_state in ('ready','failed') and not funding_dispatch.get(order.instruction_id) %}
+      <p class="attention">지급예정일과 자금 배정을 확인하세요. <a href="/payments/plan#instruction-{{ order.instruction_id }}">지급계획 열기</a></p>
       {% elif order.queue_state in ('ready','failed') and treasury %}
       <form method="post" action="/payments/{{ order.instruction_id }}/send" class="event-form">
         {{ fields() }}

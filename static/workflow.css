@@ -264,6 +264,22 @@
 .draft-text { max-width: 68ch; margin-block: var(--space-2); white-space: pre-wrap; line-height: 1.65; }
 .draft-panel[aria-busy="true"] button:disabled { cursor: wait; }
 
+.funding-summary { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.funding-summary .metric-value { font-size: clamp(1.4rem,2.6vw,2.8rem); overflow-wrap: anywhere; white-space: normal; }
+.funding-short { color: var(--warning); }
+.funding-options { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,20rem),1fr)); gap: var(--space-5); margin-block: var(--space-4); }
+.funding-options > section { padding: var(--space-4); border: 1px solid var(--line); border-radius: var(--radius-action); }
+.funding-options h4, .funding-task h4 { margin: 0; font: var(--heading-3); }
+.funding-scenario { margin-block: var(--space-2); color: var(--accent-ink); }
+.funding-task { padding-block: var(--space-4); border-top: 1px solid var(--line); }
+.funding-task .form-stack { margin-block-start: var(--space-3); }
+
+@media (max-width: 48rem) {
+  .summary.funding-summary { grid-template-columns: minmax(0,1fr); padding-block: 0; }
+  .funding-summary .metric { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-2); }
+  .summary.funding-summary .metric:nth-child(n+2) { border-inline-start: 0; border-block-start: 1px solid var(--line); }
+}
+
 @media (max-width: 48rem) {
   .work-grid { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .pay-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -1,0 +1,121 @@
+{% extends 'work_base.html' %}
+{% set section = 'payments' %}
+{% set title = '지급계획' %}
+{% set identity_next = '/payments/plan' %}
+{% from 'work_forms.html' import fields, feedback_box, money, role_label, time with context %}
+{% set treasury = actor.role == 'treasury' %}
+{% set states = {'held':'수취계좌 미확인','ready':'계좌 확인 완료','failed':'은행 실패 확정','sent':'은행 회신 대기','review':'대사 확인 중','completed':'대사 완료','bank_check':'기존 은행 결과 확인','reapproval':'정정 재승인 대기','account_recheck':'계좌 재확인'} %}
+{% macro deposit_fields(proposal_id=none) %}
+  {{ fields() }}
+  {% if proposal_id %}<input type="hidden" name="proposal_id" value="{{ proposal_id }}">{% endif %}
+  <p class="item-meta">전용 재원 밖에서 들어온 입금만 거래내역에 맞춰 입력하세요. 범위 안의 계좌 간 이체는 제외합니다.</p>
+  <div class="input-pair"><label>입금일<input type="date" name="received_on" required></label>
+    <label>확인된 입금액(원)<input type="number" min="1" step="1" name="amount" required></label></div>
+  <div class="input-pair"><label>은행 거래번호<input name="reference" required></label>
+    <label>확인한 입금 증빙<input name="evidence" required placeholder="거래내역서 참조번호"></label></div>
+  <button class="primary">실입금 확인 기록</button>
+{% endmacro %}
+{% block scripts %}<script defer src="{{ url_for('static',filename='ai-drafts.js') }}"></script>{% endblock %}
+{% block body %}
+<section class="intro">
+  <hgroup><h1>지급계획</h1><p>Corevia 원화 전용 지급 재원 · 시연 장부 · 전체 귀속월</p></hgroup>
+  <a class="secondary" href="{{ url_for('payments',month=month) }}">지급지시·대사 보기</a>
+</section>
+{{ feedback_box() }}
+
+{% set baseline = plan.baseline %}
+{% if not baseline %}<p class="attention">자금 확인 필요 · 회계·자금이 잔액과 다른 용도 배정액을 확인해야 배정할 수 있습니다.</p>{% endif %}
+{% if plan.overcommitted %}<p class="attention">기배정 자금 부족 <strong>{{ money(plan.overcommitted) }}원</strong> · 확인 잔액과 기존 배정을 대조하세요.</p>{% endif %}
+<section class="summary pay-summary funding-summary" aria-label="자금 현황">
+  {% for label, value in [('확인 잔액',plan.confirmed),('장려금 배정액',plan.reserved),('미배정 가용액',plan.free)] %}
+  <article class="metric"><h2>{{ label }}</h2><p class="metric-value">{% if baseline %}{{ money(value) }}<small>원</small>{% else %}—{% endif %}</p></article>
+  {% endfor %}
+</section>
+<section class="work-card" aria-label="자금 확인 기록">
+  {% if baseline %}
+  <div class="fact-strip"><span>잔액 기준일 <strong>{{ baseline.as_of }}</strong></span><span>사용제한 <strong>{{ money(plan.restricted) }}원</strong></span><span>타 용도 배정 <strong>{{ money(plan.external) }}원</strong></span></div>
+  <p class="item-meta">{{ baseline.scope }} · {{ baseline.evidence }} · {{ role_label(baseline.confirmed_by) }} {{ time(baseline.confirmed_at) }}</p>
+  {% endif %}
+  {% if treasury %}
+  <details class="record-detail"{% if not baseline %} open{% endif %}>
+    <summary>{{ '잔액 기준 갱신' if baseline else '기준 잔액 확인' }} <i class="chevron"></i></summary>
+    <form class="form-stack event-form" method="post" action="/payments/plan/balance">
+      {{ fields() }}
+      <div class="input-pair"><label>원화 재원 범위<input name="scope" value="{{ baseline.scope if baseline else '' }}" required{% if baseline %} readonly{% endif %} placeholder="회사·지급 전용 계좌 범위"></label>
+        <label>잔액 기준일 (일마감)<input name="as_of" type="date" required></label></div>
+      <div class="input-pair"><label>확인 잔액(원)<input name="amount" type="number" step="1" min="0" required></label>
+        <label>잔액·거래내역 대사 증빙<input name="evidence" required placeholder="잔액증명 또는 대사 자료 참조번호"></label></div>
+      <div class="input-pair"><label>사용제한액(원)<input name="restricted" type="number" step="1" min="0" required value="{{ plan.restricted }}"></label>
+        <label>타 용도 배정액(원)<input name="external" type="number" step="1" min="0" required value="{{ plan.external }}"></label></div>
+      <button class="secondary">대사한 기준 잔액 저장</button>
+    </form>
+  </details>
+  {% endif %}
+  {% if baseline %}<details class="record-detail">
+    <summary>입금 확인 내역 · {{ plan.receipts|length }}건 <i class="chevron"></i></summary>
+    {% if plan.receipts %}<ul class="event-list">{% for r in plan.receipts %}
+      <li><strong>{{ r.received_on }} · {{ money(r.amount) }}원</strong><span>{{ r.reference }} · {{ r.evidence }}{% if r.proposal_id %} · <a href="#proposal-{{ r.proposal_id }}">확보안 #{{ r.proposal_id }}</a>{% endif %}</span></li>
+    {% endfor %}</ul>{% else %}<p class="empty-copy">확인된 추가 입금이 없습니다.</p>{% endif %}
+    {% if treasury %}<details class="record-detail"><summary>별도 입금 확인 <i class="chevron"></i></summary>
+      <p class="item-meta">확보안에 따른 입금은 해당 부서 작업에서 거래를 연결하세요.</p>
+      <form class="form-stack event-form" method="post" action="/payments/plan/deposit">{{ deposit_fields() }}</form>
+    </details>{% endif %}
+  </details>{% endif %}
+</section>
+
+<section class="work-card" id="schedule">
+  <div class="work-heading"><h2>예정일별 지급계획</h2></div>
+  {% if plan.days %}
+  <div class="table-wrap" role="region" aria-label="예정일별 금액과 누적 부족액" tabindex="0">
+    <table class="compact-table"><thead><tr><th scope="col">지급예정일</th><th scope="col" class="numeric">당일 지급액</th><th scope="col" class="numeric">기배정액</th><th scope="col" class="numeric">미배정 필요액</th><th scope="col" class="numeric">누적 부족액</th>{% if treasury %}<th scope="col">자금 배정</th>{% endif %}</tr></thead>
+      <tbody>{% for day in plan.days %}<tr>
+        <th scope="row"><a href="#day-{{ day.due_date }}">{{ day.due_date }}</a></th>
+        {% for value in [day.total,day.reserved,day.needed] %}<td class="numeric number">{{ money(value) }}원</td>{% endfor %}
+        <td class="numeric number">{% if not baseline %}확인 필요{% elif day.shortage %}<strong class="funding-short">{{ money(day.shortage) }}원</strong>{% else %}0원{% endif %}</td>
+        {% if treasury %}<td>{% if baseline and day.needed and not plan.overcommitted %}
+          <form method="post" action="/payments/plan/allocate">{{ fields() }}<input type="hidden" name="due_date" value="{{ day.due_date }}"><button class="secondary" aria-label="{{ day.due_date }}까지 배정 확정">배정 확정</button></form>
+        {% else %}—{% endif %}</td>{% endif %}
+      </tr>{% endfor %}</tbody>
+    </table>
+  </div>
+  <p class="item-meta">누적 부족액은 그날까지의 미배정 필요액과 현재 가용액으로 계산합니다. 입금 예정액은 확인될 때까지 제외합니다.</p>
+  {% else %}<p class="empty-copy">지급예정일이 지정된 지시가 없습니다.</p>{% endif %}
+
+  {% set unset = plan.lines|rejectattr('due_date')|list %}
+  {% set dates = ([''] if unset else []) + (plan.days|map(attribute='due_date')|list) %}
+  {% for date in dates %}
+    {% set lines = (plan.lines|selectattr('due_date','equalto',date)|list) if date else unset %}
+    <h3 class="subheading" id="day-{{ date or 'unset' }}">{{ date or '예정일 미지정' }} <small class="item-meta">{{ lines|length }}건</small></h3>
+    {% for line in lines %}
+    <details class="order" id="instruction-{{ line.instruction_id }}">
+      <summary class="order-summary">
+        <span><strong>{{ line.agency_id }}</strong> · {{ line.rebate_id }}<small class="item-meta">지시 #{{ line.instruction_id }} · 귀속 {{ line.period_ym }}</small></span>
+        <b class="order-amount">{{ money(line.amount) }}원</b><span class="status-tag {{ 'ready' if line.reserved else '' }}">{{ '전액 배정' if line.reserved else '미배정' }}</span><i class="chevron"></i>
+      </summary>
+      <div class="order-content">
+        <p>{{ line.agency_name }} · {{ states.get(line.queue_state,line.queue_state) }} · 승인 #{{ line.approval_id }} · <a class="work-link" href="{{ url_for('payments',month=line.period_ym,group=line.agency_id) }}">지급지시·승인 근거 보기</a></p>
+        {% for opt in advice if opt.instruction_id == line.instruction_id and opt.status in ('funding_pending','reschedule_pending','ready_to_move') %}
+        <p class="next-action"><a href="#proposal-{{ opt.proposal_id }}">{{ '추가 입금 확인 대기' if opt.choice == 'funding' else '일정 조정 작업' }} #{{ opt.proposal_id }}</a> · {{ money(opt.target_amount) ~ '원' if opt.choice == 'funding' else opt.new_date }}</p>
+        {% endfor %}
+        {% if treasury and line.state in ('held','ready','failed') %}
+          <details class="record-detail"{% if not date %} open{% endif %}><summary>지급예정일 {{ '변경' if date else '지정' }} <i class="chevron"></i></summary>
+          <form action="/payments/plan/schedule" method="post" class="form-stack">
+            {{ fields() }}<input type="hidden" name="instruction_id" value="{{ line.instruction_id }}">
+            <input type="hidden" name="expected_version" value="{{ line.schedule_version }}">
+            <div class="input-pair"><label>지급예정일<input name="due_date" type="date" value="{{ date }}" required></label><label>일정 사유<input name="reason" required></label></div>
+            <button class="secondary">지급예정일 저장</button>
+          </form></details>
+          {% if line.reserved %}<details class="record-detail"><summary>기존 배정 해제 <i class="chevron"></i></summary>
+          <form action="/payments/plan/release" method="post" class="form-stack">
+            {{ fields() }}<input type="hidden" name="instruction_id" value="{{ line.instruction_id }}">
+            <input type="hidden" name="expected_reservation" value="{{ line.reservation_version }}">
+            <label>해제 사유<input name="reason" required></label><button class="secondary danger">배정 해제</button>
+          </form></details>{% endif %}
+        {% endif %}
+      </div>
+    </details>
+    {% endfor %}
+  {% endfor %}
+</section>
+{% include 'funding_advice.html' %}
+{% endblock %}

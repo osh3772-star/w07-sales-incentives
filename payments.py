@@ -2,6 +2,8 @@
 
 import uuid
 
+import funding
+
 from rules import account_key, month_overview
 from workflow_security import require_role
 
@@ -198,6 +200,7 @@ def send_mock(db, actor, instruction_id, expected_attempt=None):
         elif expected_attempt:
             raise ValueError("이 지급지시에는 재처리할 이전 시도가 없습니다.")
 
+        funding.check_dispatch(db, instruction_id)
         attempt_id = "MOCK-" + uuid.uuid4().hex
         db.execute(
             """INSERT INTO mock_payment_attempts
@@ -305,6 +308,7 @@ def record_reply(db, actor, reply_id, attempt_id, amount, account, result):
             (reply_id, attempt_id, amount, account, result, outcome, reason, actor.user_id),
         )
         if state:
+            funding.reconcile_mock(db, actor, attempt["instruction_id"], reply_id, state)
             db.execute("UPDATE payment_instructions SET state=? WHERE instruction_id=?",
                        (state, attempt["instruction_id"]))
             _record_correction_followup(db, attempt, state, reply_id, actor)

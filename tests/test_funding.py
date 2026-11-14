@@ -1,0 +1,246 @@
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from pathlib import Path
+from unittest.mock import patch
+
+import funding
+from app import SOURCE_ROOT, create_app
+from approvals import decide_approval, submit_approval
+from corrections import apply_correction
+from payments import confirm_account, record_reply, send_mock
+from store import create_funding_database, open_db, receive_month, sync_sources
+from workflow_security import USERS
+
+
+STAFF, EXEC, TREASURY = (USERS[role] for role in ("staff", "executive", "treasury"))
+SCOPE = "시연 Corevia 원화 전용자금"
+DAY, LATER = "2026-07-10", "2026-07-13"
+ACCOUNT = "모의은행 1200-300"
+
+
+class FundingLedgerTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "funding.sqlite3"
+        create_funding_database(self.path)
+        self.db = open_db(self.path)
+        self.addCleanup(self.db.close)
+        sync_sources(self.db, SOURCE_ROOT)
+        receive_month(self.db, "2026-06")
+        approval_id = submit_approval(self.db, STAFF, "2026-06", "D-011", "실제 3건 합산")
+        decide_approval(self.db, EXEC, approval_id, "approve", "임원 승인")
+        self.ids = [r[0] for r in self.db.execute("SELECT instruction_id FROM payment_instructions ORDER BY instruction_id")]
+        for iid in self.ids:
+            funding.schedule(self.db, TREASURY, iid, DAY, "원 지급예정일")
+        today = patch("funding._today", return_value="2026-07-14")
+        today.start()
+        self.addCleanup(today.stop)
+
+    def baseline(self, amount=3_000_000, day="2026-07-09", **fields):
+        return funding.set_balance(self.db, TREASURY, amount, day, "잔액증명 대조", SCOPE, **fields)
+
+    def balance(self):
+        v = funding.overview(self.db)
+        return v["confirmed"], v["reserved"], v["free"], v["days"][-1]["shortage"]
+
+    def concurrent(self, action):
+        def run(_):
+            with closing(open_db(self.path)) as db:
+                return action(db)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            return list(pool.map(run, range(2)))
+
+    def treasury_post(self, path, **fields):
+        client = create_app(self.path).test_client()
+        with client.session_transaction() as session:
+            session["user_id"] = TREASURY.user_id
+            session["csrf_token"] = "funding-test"
+        return client.post(path, data={"csrf_token": "funding-test", "month": "2026-06", **fields},
+                           follow_redirects=True)
+
+    def test_only_500000_received_leaves_388097_short_on_original_date(self):
+        self.baseline()
+        funding.allocate(self.db, TREASURY, DAY)
+        self.assertEqual(self.balance()[-1], 888_097)
+
+        receipt = self.treasury_post("/payments/plan/deposit", reference="부분입금-1", amount="500000",
+                                     received_on=DAY, evidence="50만원 입금 확인서")
+        self.assertEqual(receipt.status_code, 200)
+        self.assertIn("388,097원", receipt.get_data(as_text=True))
+        allocation = self.treasury_post("/payments/plan/allocate", due_date=DAY)
+        self.assertEqual(allocation.status_code, 200)
+        self.assertIn("새로 배정한 지급지시 0건", allocation.get_data(as_text=True))
+
+        view = funding.overview(self.db)
+        self.assertEqual([(d["due_date"], d["total"], d["shortage"]) for d in view["days"]],
+                         [(DAY, 3_888_097, 388_097)])
+        self.assertEqual([(r["reference"], r["amount"]) for r in view["receipts"]], [("부분입금-1", 500_000)])
+        self.assertEqual((view["confirmed"], view["reserved"], view["free"]), (3_500_000, 2_562_561, 937_439))
+        self.assertEqual([r["agency_id"] for r in view["lines"] if not r["allocated"]], ["D-037"])
+
+    def test_full_allocation_still_blocks_unverified_account_and_correction(self):
+        self.baseline(3_888_097)
+        funding.allocate(self.db, TREASURY, DAY)
+        initial = funding.overview(self.db)
+        self.assertEqual((initial["reserved"], initial["free"]), (3_888_097, 0))
+        lines = {line["agency_id"]: line for line in initial["lines"]}
+        self.assertEqual(set(lines), {"D-011", "D-024", "D-037"})
+        self.assertTrue(all(line["funds_ready"] for line in lines.values()))
+
+        def assert_send_blocked(iid, message):
+            response = self.treasury_post(f"/payments/{iid}/send")
+            self.assertEqual(response.status_code, 400)
+            self.assertIn(message, response.get_data(as_text=True))
+            self.assertEqual(self.db.execute("SELECT count(*) FROM mock_payment_attempts").fetchone()[0], 0)
+            self.assertEqual(self.balance(), (3_888_097, 3_888_097, 0, 0))
+
+        self.assertEqual(lines["D-024"]["queue_state"], "held")
+        assert_send_blocked(lines["D-024"]["instruction_id"], "수취계좌와 증빙을 확인할 때까지 지급 보류")
+
+        iid = lines["D-011"]["instruction_id"]
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "수취계좌 확인서")
+        apply_correction(self.db, STAFF, "D-011", {"address": "검증시 새 도로 123"},
+                         "2026-06-15", "승인 후 주소 정정", "변경 확인서")
+        corrected = next(r for r in funding.overview(self.db)["lines"] if r["instruction_id"] == iid)
+        self.assertEqual((corrected["state"], corrected["queue_state"], corrected["funds_ready"]),
+                         ("ready", "reapproval", True))
+        assert_send_blocked(iid, "등록정보 정정으로 지급 보류")
+
+    def test_two_dates_compete_for_the_same_cash(self):
+        self.baseline()
+        funding.schedule(self.db, TREASURY, self.ids[-1], LATER, "다음 예정일")
+
+        def reserve(day):
+            with closing(open_db(self.path)) as db:
+                return funding.allocate(db, TREASURY, day)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            booked = [iid for result in pool.map(reserve, (DAY, LATER)) for iid in result]
+        self.assertCountEqual(booked, self.ids[:2])
+        view = funding.overview(self.db)
+        self.assertEqual([(d["due_date"], d["shortage"]) for d in view["days"]], [(DAY, 0), (LATER, 888_097)])
+        self.assertEqual((view["reserved"], view["free"]), (2_562_561, 437_439))
+
+    def test_source_amounts_funding_and_two_concurrent_claimants(self):
+        self.baseline()
+        self.assertEqual(self.balance(), (3_000_000, 0, 3_000_000, 888_097))
+        results = self.concurrent(lambda db: funding.allocate(db, TREASURY, DAY))
+        self.assertCountEqual(results, [self.ids[:2], []])
+        self.assertEqual(self.balance(), (3_000_000, 2_562_561, 437_439, 888_097))
+        receive = lambda db: funding.confirm_receipt(db, TREASURY, "은행고유거래-1", 900_000, DAY, "보통예금 입금 증명")
+        self.assertCountEqual(self.concurrent(receive), [True, False])
+        self.assertEqual(self.balance(), (3_900_000, 2_562_561, 1_337_439, 0))
+        self.assertEqual(funding.allocate(self.db, TREASURY, DAY), self.ids[2:])
+        self.assertEqual(self.balance(), (3_900_000, 3_888_097, 11_903, 0))
+        with self.assertRaises(ValueError):
+            funding.confirm_receipt(self.db, TREASURY, "은행고유거래-1", 1_800_000, DAY, "다른 내용")
+        with closing(open_db(self.path)) as other:
+            self.assertFalse(receive(other))
+            self.assertEqual(funding.overview(other)["free"], 11_903)
+            self.assertEqual(other.execute("SELECT count(*) FROM cash_plan_events WHERE action='reserve'").fetchone()[0], 3)
+            self.assertEqual(other.execute("SELECT count(*) FROM cash_receipts").fetchone()[0], 1)
+
+    def test_defer_does_not_cover_next_date_and_partial_income_counts_once(self):
+        self.baseline()
+        funding.allocate(self.db, TREASURY, DAY)
+        funding.schedule(self.db, TREASURY, self.ids[-1], LATER, "거래처 조정 동의서", expected_date=DAY)
+        days = funding.overview(self.db)["days"]
+        self.assertEqual([(d["due_date"], d["total"], d["shortage"]) for d in days],
+                         [(DAY, 2_562_561, 0), (LATER, 1_325_536, 888_097)])
+        self.assertEqual(funding.allocate(self.db, TREASURY, LATER), [])
+        funding.confirm_receipt(self.db, TREASURY, "부분입금", 500_000, DAY, "첫 입금 확인")
+        self.assertEqual(self.balance(), (3_500_000, 2_562_561, 937_439, 388_097))
+        self.baseline(3_500_000, DAY)
+        self.assertEqual(self.balance(), (3_500_000, 2_562_561, 937_439, 388_097))
+        self.assertFalse(funding.confirm_receipt(self.db, TREASURY, "부분입금", 500_000, DAY, "첫 입금 확인"))
+        with self.assertRaises(ValueError):
+            funding.confirm_receipt(self.db, TREASURY, "중복 계상 시도", 500_000, DAY, "마감 잔액에 포함된 거래")
+        with self.assertRaises(ValueError):
+            funding.confirm_receipt(self.db, TREASURY, "약정", 400_000, "2026-07-15", "도착 예정")
+
+    def test_due_account_and_bank_outcome_gates_keep_one_debit(self):
+        iid = self.ids[0]
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "시연 수취 증빙")
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, iid)
+        self.baseline()
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, iid)
+        funding.allocate(self.db, TREASURY, DAY)
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, self.ids[1])   # fully reserved, no account
+        with patch("funding._today", return_value="2026-07-09"), self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, iid)
+        attempt = send_mock(self.db, TREASURY, iid)
+        self.assertEqual(send_mock(self.db, TREASURY, iid), attempt)
+        with self.assertRaises(ValueError):
+            funding.release(self.db, TREASURY, iid, "전송 중")
+        with self.assertRaises(ValueError):
+            funding.schedule(self.db, TREASURY, iid, LATER, "전송 중")
+        self.assertEqual(record_reply(self.db, TREASURY, "불일치", attempt, 3000, ACCOUNT, "success"), "review")
+        self.assertEqual(self.balance(), (3_000_000, 2_562_561, 437_439, 888_097))
+        self.assertEqual(record_reply(self.db, TREASURY, "실패", attempt, 1_373_515, ACCOUNT, "failure"), "failed")
+        retry = send_mock(self.db, TREASURY, iid, expected_attempt=attempt)
+        self.assertNotEqual(retry, attempt)
+        for _ in range(2):
+            self.assertEqual(record_reply(self.db, TREASURY, "성공", retry, 1_373_515, ACCOUNT, "success"), "matched")
+        self.assertEqual(self.balance(), (1_626_485, 1_189_046, 437_439, 888_097))
+        self.baseline(1_626_485, "2026-07-14")
+        self.assertEqual(self.balance(), (1_626_485, 1_189_046, 437_439, 888_097))
+
+    def test_revised_cash_and_correction_keep_existing_reservations(self):
+        self.baseline()
+        funding.allocate(self.db, TREASURY, DAY)
+        iid = self.ids[0]
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "기존 증빙")
+        self.baseline(3_000_000, DAY, restricted=50_000, external=450_000)
+        self.assertEqual(funding.overview(self.db)["overcommitted"], 62_561)
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, iid)
+        self.baseline(3_000_000, LATER)
+        apply_correction(self.db, STAFF, "D-011", {"address": "검증시 새 도로 123"},
+                         "2026-06-15", "등록정보 정정", "증빙")
+        self.assertTrue(any(r["queue_state"] == "reapproval" for r in funding.overview(self.db)["lines"]))
+        self.assertEqual(funding.overview(self.db)["reserved"], 2_562_561)
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, iid)
+        with self.assertRaises(PermissionError):
+            funding.release(self.db, STAFF, iid, "권한 확인")
+
+    def test_failed_payment_released_then_disputed_relocks_overcommitted_cash(self):
+        self.baseline(1_373_515)
+        funding.allocate(self.db, TREASURY, DAY)
+        first, second, _ = self.ids
+        confirm_account(self.db, TREASURY, first, ACCOUNT, "수취계좌 확인서")
+        attempt = send_mock(self.db, TREASURY, first)
+        record_reply(self.db, TREASURY, "거절", attempt, 1_373_515, ACCOUNT, "failure")
+        funding.release(self.db, TREASURY, first, "실패 확정, 영업지원과 지급일 재협의")
+        funding.schedule(self.db, TREASURY, first, LATER, "일정 협의 완료")
+        self.assertEqual(funding.allocate(self.db, TREASURY, DAY), [second])
+        record_reply(self.db, TREASURY, "상충", attempt, 1_373_515, ACCOUNT, "success")
+        disputed = funding.overview(self.db)
+        self.assertEqual((disputed["reserved"], disputed["overcommitted"]), (2_562_561, 1_189_046))
+        confirm_account(self.db, TREASURY, second, ACCOUNT, "별도 증빙")
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, second)
+        record_reply(self.db, TREASURY, "최종확인", attempt, 1_373_515, ACCOUNT, "success")
+        final = funding.overview(self.db)
+        self.assertEqual((final["confirmed"], final["reserved"], final["free"]), (0, 1_189_046, 0))
+
+    def test_stale_release_cannot_release_a_new_reservation(self):
+        self.baseline()
+        funding.allocate(self.db, TREASURY, DAY)
+        first = funding.overview(self.db)["lines"][0]
+        iid, token = first["instruction_id"], first["reservation_version"]
+        self.assertTrue(funding.release(self.db, TREASURY, iid, "신청 취소", expected_reservation=token))
+        self.assertFalse(funding.release(self.db, TREASURY, iid, "신청 취소", expected_reservation=token))
+        self.assertEqual(funding.allocate(self.db, TREASURY, DAY), [iid])
+        with self.assertRaises(ValueError):
+            funding.release(self.db, TREASURY, iid, "신청 취소", expected_reservation=token)
+        active = funding.overview(self.db)["lines"][0]
+        self.assertTrue(active["allocated"])
+        self.assertNotEqual(active["reservation_version"], token)

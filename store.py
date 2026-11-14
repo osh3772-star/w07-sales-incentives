@@ -3,6 +3,7 @@
 import csv
 import json
 import sqlite3
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 
@@ -82,6 +83,23 @@ def open_db(db_path):
         db.close()
         raise
     return db
+
+
+def create_funding_database(path):
+    """Create the optional planning ledger in a new workflow DB only."""
+    from funding import FUNDING_SCHEMA
+    from funding_ai import FUNDING_AI_SCHEMA
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb"):
+        pass
+    try:
+        with closing(open_db(path)) as db:
+            db.executescript("BEGIN IMMEDIATE;\n" + FUNDING_SCHEMA + "\n" + FUNDING_AI_SCHEMA + "\nCOMMIT;")
+    except Exception:
+        path.unlink()  # This invocation created the file exclusively.
+        raise
 
 
 def _parse_row(row, fields):

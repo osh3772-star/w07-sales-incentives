@@ -13,6 +13,12 @@ class ProviderError(RuntimeError):
 
 
 TASKS = {
+    "funding_options": "두 가지 자금 부족 대응안을 각각 한국어로 작성한다. funding은 제공된 목표액의 추가 회수·"
+                       "입금 증빙 확인을, reschedule은 대상 대리점과 후보일 협의 후 회계 확정을 제안한다. "
+                       "원안과 변경일의 누적 부족액이 어떻게 바뀌는지 제공된 수치를 사용한다. "
+                       "가정만으로 입금이나 업무 승인을 확정하지 않는다. "
+                       "반드시 JSON 객체 하나로 응답한다. instruction_id, target_amount, new_date는 자료의 값을 "
+                       "그대로 복사하고 funding과 reschedule은 각 대안의 이유·조치·담당 부서를 담은 문자열로 작성한다.",
     "summary": "그룹의 관련자 연결 경로, 월 누계, 계좌 차이, 소명 답변과 미확인 사항을 근거 요약으로 작성한다.",
     "question": "target_rebate_id의 대리점에 보낼 구체적인 소명 질문을 작성한다. 기존 답변을 반영하고 "
                 "남은 차이 및 확인할 증빙을 묻는다. 지급 계좌번호의 회신을 요구하지 않는다.",
@@ -51,7 +57,7 @@ def _codex_binary():
     raise ProviderError("서버에서 Codex CLI를 찾을 수 없습니다. 설치 경로와 W07_CODEX_BINARY를 확인하세요.")
 
 
-def _command(model):
+def _command(model, funding=False):
     args = [_codex_binary(), "-a", "never", "exec", "--model", model, "--ignore-user-config",
             "--ignore-rules", "--ephemeral", "--skip-git-repo-check", "--json"]
     for feature in ("shell_tool", "apps", "plugins", "hooks", "memories", "multi_agent", "multi_agent_v2",
@@ -65,7 +71,9 @@ def _command(model):
         "permissions.w07_draft.network.enabled=false", 'web_search="disabled"',
         "project_doc_max_bytes=0", "tools.update_plan.enabled=false", 'model_reasoning_effort="low"',
         "suppress_unstable_features_warning=true",
-        "developer_instructions=" + json.dumps(INSTRUCTIONS, ensure_ascii=False),
+        "developer_instructions=" + json.dumps(
+            INSTRUCTIONS + (" 이번 지급계획 요청의 최종 응답 형식은 지정된 JSON 객체 하나다." if funding else ""),
+            ensure_ascii=False),
     ):
         args.extend(["-c", config])
     return [*args, "-"]
@@ -106,7 +114,8 @@ def generate_text(kind, context):
     env = {key: value for key, value in os.environ.items() if not key.startswith("CODEX_") or key == "CODEX_HOME"}
     try:
         with tempfile.TemporaryDirectory(prefix="w07-draft-") as directory:
-            result = subprocess.run(_command(model), input=prompt.encode("utf-8"), capture_output=True,
+            args = _command(model, funding=kind == "funding_options")
+            result = subprocess.run(args, input=prompt.encode("utf-8"), capture_output=True,
                                     timeout=90, cwd=directory, env=env, shell=False,
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
