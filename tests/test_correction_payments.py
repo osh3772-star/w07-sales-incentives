@@ -6,7 +6,7 @@ from pathlib import Path
 from app import SOURCE_ROOT
 from approvals import decide_approval, submit_approval
 from corrections import apply_correction, complete_post_review
-from payments import confirm_account, list_payments, record_reply, send_mock
+from payments import confirm_account, list_payments, record_reply, resolve_bank_review, send_mock
 from store import open_db, receive_month, sync_sources
 from workflow_security import USERS
 
@@ -155,6 +155,33 @@ class CorrectionPaymentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             send_mock(self.db, TREASURY, self.iid, first)
         record_reply(self.db, TREASURY, "CONFIRMED", first, AMOUNT, ACCOUNT, "success")
+        self.assertTrue(self.order()["bank_conflict"])
+        resolve_bank_review(self.db, TREASURY, self.iid, "completed", "회계가 시도 결과 확인",
+                            self.order()["reply_version"], "CONFIRMED")
         paid = self.order()
         self.assertEqual((paid["state"], paid["post_review"], len(paid["attempts"])), ("completed", True, 1))
         self.assertEqual(paid["effective_approval_id"], revised)
+
+    def test_nonpayment_after_post_review_reopens_reapproval_and_account_checks(self):
+        first = send_mock(self.db, TREASURY, self.iid)
+        record_reply(self.db, TREASURY, "SUCCESS", first, AMOUNT, ACCOUNT, "success")
+        corrected_account = "모의은행 040-010"
+        apply_correction(self.db, STAFF, "D-001", {"bank_account_no": corrected_account}, "2026-06-15",
+                         "지급 완료 뒤 등록계좌 정정", "시연 등록계좌 변경 확인서")
+        post_review, = [t for t in self.order()["correction_tasks"] if t["kind"] == "post_review"]
+        complete_post_review(self.db, TREASURY, post_review["task_id"], "당시 은행 성공 회신 대조")
+        record_reply(self.db, TREASURY, "REVERSED", first, AMOUNT, ACCOUNT, "failure")
+        resolve_bank_review(self.db, TREASURY, self.iid, "retry", "은행의 최종 취소 확인서",
+                            self.order()["reply_version"])
+        self.assertEqual(self.order()["queue_state"], "reapproval")
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, self.iid, first)
+        revised = submit_approval(self.db, STAFF, MONTH, "D-001", "정정 계좌로 재상신")
+        decide_approval(self.db, LEAD, revised, "approve", "변경 근거와 미지급 확인서 검토")
+        self.assertEqual(self.order()["queue_state"], "account_recheck")
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, self.iid, first)
+        confirm_account(self.db, TREASURY, self.iid, corrected_account, "정정 이후 계좌 확인서")
+        retry = send_mock(self.db, TREASURY, self.iid, first)
+        self.assertEqual(record_reply(self.db, TREASURY, "FINAL", retry, AMOUNT, corrected_account, "success"),
+                         "matched")

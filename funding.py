@@ -42,6 +42,20 @@ def enabled(db):
     return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cash_balances'").fetchone() is not None
 
 
+# On upgrade, old failures may already have released a reservation before a conflicting reply.
+BANK_REVIEW_RESERVATIONS_SQL = """
+INSERT INTO cash_plan_events(instruction_id,action,previous_date,due_date,amount,reason,actor)
+SELECT p.instruction_id,'reserve',p.due_date,p.due_date,i.amount_krw,'기존 은행 회신 상충 재확인','system'
+FROM cash_plans p JOIN payment_instructions i USING(instruction_id)
+JOIN bank_result_reviews b USING(instruction_id)
+WHERE p.reserved=0 AND b.decision IS NULL AND i.state='review';
+UPDATE cash_plans SET reserved=1 WHERE reserved=0 AND instruction_id IN (
+    SELECT i.instruction_id FROM payment_instructions i JOIN bank_result_reviews b USING(instruction_id)
+    WHERE b.decision IS NULL AND i.state='review'
+);
+"""
+
+
 @contextmanager
 def write(db):
     if db.in_transaction:
@@ -279,6 +293,36 @@ def check_dispatch(db, instruction_id):
         view = overview(db)
         if not any(r["instruction_id"] == instruction_id and r["funds_ready"] for r in view["lines"]):
             raise ValueError("대사한 회사 잔액, 전액 자금 배정 및 지급예정일 도래를 확인하세요.")
+
+
+def invalidate_amount_reservation(db, actor, instruction_id):
+    """Release the previously reserved sum inside the reapproval transaction."""
+    if not enabled(db):
+        return
+    if not db.in_transaction:
+        raise RuntimeError("금액 변경과 기존 배정 해제는 함께 기록해야 합니다.")
+    plan = db.execute(
+        """SELECT p.instruction_id, p.due_date, i.amount_krw AS amount FROM cash_plans p
+           JOIN payment_instructions i USING(instruction_id)
+           WHERE p.instruction_id=? AND p.reserved=1""", (instruction_id,),
+    ).fetchone()
+    if plan:
+        db.execute("UPDATE cash_plans SET reserved=0 WHERE instruction_id=?", (instruction_id,))
+        _event(db, actor, plan, "release", "재승인 금액 변경으로 기존 배정 해제", plan["due_date"])
+
+
+def reverse_mock_debit(db, actor, instruction_id, review_id):
+    """Archive the one active simulated debit on an explicit treasury nonpayment decision."""
+    require_role(actor, "treasury")
+    if not db.in_transaction:
+        raise RuntimeError("회계 결과 결정과 모의 출금 정정은 함께 저장해야 합니다.")
+    if enabled(db):
+        db.execute(
+            """INSERT INTO reversed_mock_debits(review_id,instruction_id,reply_id,amount,paid_on,balance_id)
+               SELECT ?, instruction_id, reply_id, amount, paid_on, balance_id FROM cash_mock_debits
+               WHERE instruction_id=?""", (review_id, instruction_id),
+        )
+        db.execute("DELETE FROM cash_mock_debits WHERE instruction_id=?", (instruction_id,))
 
 
 def reconcile_mock(db, actor, instruction_id, reply_id, state):

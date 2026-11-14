@@ -6,7 +6,7 @@ from pathlib import Path
 
 from app import SOURCE_ROOT
 from approvals import decide_approval, submit_approval
-from payments import confirm_account, create_instructions, list_payments, record_reply, send_mock
+from payments import confirm_account, create_instructions, list_payments, record_reply, resolve_bank_review, send_mock
 from store import open_db, receive_month, sync_sources
 from workflow_security import USERS
 
@@ -71,7 +71,7 @@ class PaymentTests(unittest.TestCase):
             self.assertEqual(list_payments(reopened, MONTH), before)
         self.assertCountEqual([o["state"] for o in self.orders()], ["completed", "held", "held"])
 
-    def test_mismatch_failure_retry_then_ignored_delayed_reply(self):
+    def test_mismatch_and_conflicting_replies_require_treasury_confirmation(self):
         self.approve("D-001", TEAM_LEAD)
         order, = self.orders()
         self.assertEqual((order["rebate_id"], order["amount_krw"]), ("RB-00006", 988_932))
@@ -80,18 +80,23 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(record_reply(self.db, TREASURY, "ACCOUNT", first, 988_932, "타행 001-000-123", "failure"),
                          "review")
         self.assertEqual(self.orders()[0]["state"], "review")
-        self.assertEqual(send_mock(self.db, TREASURY, order["instruction_id"]), first)
-        self.assertEqual(record_reply(self.db, TREASURY, "FAILED", first, 988_932, ACCOUNT, "failure"), "failed")
+        with self.assertRaises(ValueError):
+            send_mock(self.db, TREASURY, order["instruction_id"])
+        self.assertEqual(record_reply(self.db, TREASURY, "FAILED", first, 988_932, ACCOUNT, "failure"), "review")
+        resolve_bank_review(self.db, TREASURY, order["instruction_id"], "retry", "전체 시도 미지급 증빙",
+                            self.orders()[0]["reply_version"])
         with self.assertRaises(ValueError):
             send_mock(self.db, TREASURY, order["instruction_id"], "잘못된 시도번호")
         second = send_mock(self.db, TREASURY, order["instruction_id"], first)
         self.assertNotEqual(first, second)
         self.assertEqual(send_mock(self.db, TREASURY, order["instruction_id"], first), second)
-        self.assertEqual(record_reply(self.db, TREASURY, "LATE", first, 988_932, ACCOUNT, "success"), "late")
-        self.assertEqual(self.orders()[0]["state"], "sent")
+        self.assertEqual(record_reply(self.db, TREASURY, "LATE", first, 988_932, ACCOUNT, "success"), "review")
+        self.assertTrue(self.orders()[0]["bank_conflict"])
         for _ in range(2):
             self.assertEqual(record_reply(self.db, TREASURY, "DONE", second, 988_932, "모의은행 001000123", "success"),
-                             "matched")
+                             "review")
+        resolve_bank_review(self.db, TREASURY, order["instruction_id"], "completed", "두 시도 중 두 번째 성공 증빙",
+                            self.orders()[0]["reply_version"], "DONE")
         with self.assertRaises(ValueError):
             record_reply(self.db, TREASURY, "DONE", second, 988_931, ACCOUNT, "success")
         order, = self.orders()

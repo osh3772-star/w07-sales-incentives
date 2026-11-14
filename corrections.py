@@ -205,7 +205,11 @@ def apply_correction(db, actor, agency_id, changes, effective_date, reason, evid
 
 def list_tasks(db, month, group=None):
     rows = db.execute(
-        """SELECT t.*,r.agency_id,r.rebate_amount_krw FROM correction_tasks t JOIN rebates r USING(rebate_id)
+        """SELECT t.*,r.agency_id,
+                  CASE WHEN t.kind='reapproval' AND t.status='open' THEN r.rebate_amount_krw
+                       ELSE COALESCE(i.amount_krw,r.source_amount_krw) END AS rebate_amount_krw
+           FROM correction_tasks t JOIN effective_rebates r USING(rebate_id)
+           LEFT JOIN payment_instructions i USING(instruction_id)
            WHERE t.period_ym=? ORDER BY t.task_id DESC""", (month,),
     ).fetchall()
     membership = registered_groups(effective_agencies(db, month))[1] if rows else {}

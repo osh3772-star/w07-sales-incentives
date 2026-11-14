@@ -2,7 +2,7 @@
 {% set section = 'payments' %}
 {% set title = '지급지시·대사' %}
 {% from 'work_forms.html' import money, selector, fields, feedback_box, role_label, time with context %}
-{% set states = {'held':'지급 보류','ready':'전송 준비','sent':'회신 대기','review':'대사 확인 중','failed':'지급 실패','completed':'대사 완료','reapproval':'정정 지급 보류','bank_check':'기존 은행 결과 확인','account_recheck':'수취계좌 재확인'} %}
+{% set states = {'held':'지급 보류','ready':'전송 준비','sent':'회신 대기','review':'대사 확인 중','failed':'지급 실패','completed':'대사 완료','reapproval':'정정 지급 보류','bank_check':'기존 은행 결과 확인','account_recheck':'수취계좌 재확인','basis_review':'월 명세 재승인 대기','source_review':'정산 원본 불일치'} %}
 {% set outcomes = {'matched':'대사 완료','failed':'지급 실패','review':'대사 확인 중','unmatched':'지시 미연결','late':'추가 회신'} %}
 {% macro masked(account) -%}
   {%- if account -%}{% set compact = account|replace('-','')|replace(' ','') %}•••• {{ compact[-4:] }}{%- else -%}미확인{%- endif -%}
@@ -37,7 +37,7 @@
   {% set ready = visible_orders|selectattr('queue_state','equalto','ready')|list %}
   {% set blocked = namespace(count=0) %}
   {% if funding_enabled %}{% for item in ready if not funding_dispatch.get(item.instruction_id) %}{% set blocked.count = blocked.count + 1 %}{% endfor %}{% endif %}
-  {% set held = visible_orders|selectattr('queue_state','in',('held','reapproval','account_recheck'))|list %}
+  {% set held = visible_orders|selectattr('queue_state','in',('held','reapproval','account_recheck','basis_review','source_review'))|list %}
   {% for label, value in [('전송 준비',(ready|length) - blocked.count),('지급 보류',(held|length) + blocked.count),('기존 은행 결과 확인',visible_orders|selectattr('queue_state','equalto','bank_check')|list|length),('대사 완료',visible_orders|selectattr('state','equalto','completed')|list|length)] %}
   <article class="metric"><h2>{{ label }}</h2><p class="metric-value">{{ value }}<small>건</small></p></article>
   {% endfor %}
@@ -63,10 +63,14 @@
         <dl class="log"><dt>이전 확인 · {{ role_label(check.previous_verified_by) }} {{ time(check.previous_verified_at) }}</dt><dd>{{ masked(check.previous_account) }} · {{ check.previous_evidence }}</dd>
           <dt>다시 확인 · {{ role_label(check.verified_by) }} {{ time(check.verified_at) }}</dt><dd>{{ masked(check.account) }} · {{ check.evidence }}</dd></dl>
       </details>{% endfor %}
+      {% if order.group_amount_hold or order.source_hold %}
+      <p class="attention">{{ order.group_amount_hold or '정산 원본 불일치' }} <a href="{{ url_for('index',month=month) }}">접수 화면에서 입력값·판단 이력 확인</a></p>
+      {% endif %}
+      {% if order.monthly_hold %}<p class="attention">{{ order.monthly_hold }} <a href="{{ url_for('approvals',month=month,group=src.group_id) }}">현재 그룹의 결재 명세 보기</a></p>{% endif %}
       {% if order.queue_state == 'reapproval' %}
       <p class="attention">정정 지급 보류 · <a href="{{ url_for('approvals',month=month,group=src.group_id) }}">현재 그룹의 재승인 작업 보기</a></p>
       {% elif order.queue_state == 'bank_check' %}
-      <p class="attention">기존 은행 결과 확인 · 시도 {{ order.latest_attempt }}의 금액·수취계좌·처리결과를 대사하세요.</p>
+      <p class="attention">기존 은행 결과 확인 · 시도 {{ order.latest_attempt }}의 금액·수취계좌·처리결과와 이전 시도들의 회신을 대사하세요.</p>
       {% elif order.queue_state in ('held','account_recheck') %}
       <p class="attention">{{ '등록계좌 정정 후 수취계좌 증빙을 다시 확인하세요.' if order.queue_state == 'account_recheck' else '수취계좌 미확인으로 지급을 보류했습니다. 회계·자금이 별도 증빙으로 확인하면 모의 전송할 수 있습니다.' }}</p>
       {% if treasury %}
@@ -95,6 +99,23 @@
           <span>{{ reply.reason }} · {{ time(reply.received_at) }}</span>
         </li>{% endfor %}
       </ul>{% endif %}
+      {% if order.bank_conflict %}
+      <p class="attention">은행 회신 상충 · 모든 전송 시도의 결과와 실제 출금 여부를 확인할 때까지 추가 전송을 보류합니다.</p>
+      {% if treasury %}<form class="form-stack" method="post" action="/payments/{{ order.instruction_id }}/bank-review">
+        {{ fields() }}<input type="hidden" name="reply_version" value="{{ order.reply_version }}">
+        <label>전체 시도 확인 결과<select name="decision" required><option value="">선택</option>
+          <option value="completed">지급 완료 확인</option><option value="retry">모든 시도 미지급 확인 · 재시도 검토</option>
+        </select></label>
+        <label>지급 완료로 확인한 성공 회신<select name="success_reply"><option value="">선택</option>
+          {% for reply in order.replies if reply.confirmed_success %}<option value="{{ reply.reply_id }}">{{ reply.reply_id }} · {{ reply.attempt_id }}</option>{% endfor %}
+        </select></label>
+        <label>각 시도의 은행 확인 결과와 증빙<textarea name="evidence" required></textarea></label>
+        <button class="primary">회계 확인 결과 기록</button>
+      </form>{% endif %}{% endif %}
+      {% for review in order.bank_reviews if review.decision %}<p class="item-meta">회계 확인 #{{ review.review_id }} ·
+        {{ '지급 완료' if review.decision == 'completed' else '모든 시도 미지급 확인' }}
+        {% if review.success_reply %} · {{ review.success_reply }}{% endif %}
+        · {{ review.evidence }} · {{ role_label(review.reviewed_by) }} {{ time(review.reviewed_at) }}</p>{% endfor %}
       {% if order.state in ('sent','review') and treasury %}
       <div class="event-form"><h3 class="subheading">모의 은행 회신 입력</h3>{{ reply_form(order) }}</div>
       {% endif %}

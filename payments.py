@@ -3,6 +3,8 @@
 import uuid
 
 import funding
+import monthly_basis
+import amount_reviews
 
 from rules import account_key, month_overview
 from workflow_security import require_role
@@ -38,6 +40,34 @@ CREATE TABLE IF NOT EXISTS mock_bank_replies (
 );
 CREATE INDEX IF NOT EXISTS replies_by_attempt ON mock_bank_replies(attempt_id);
 """
+
+BANK_REVIEW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS bank_result_reviews (
+    review_id INTEGER PRIMARY KEY, instruction_id INTEGER NOT NULL REFERENCES payment_instructions,
+    opened_by_reply TEXT NOT NULL UNIQUE REFERENCES mock_bank_replies,
+    decision TEXT CHECK(decision IN ('completed','retry')), evidence TEXT, reviewed_by TEXT, reviewed_at TEXT,
+    through_reply INTEGER, through_sequence INTEGER, success_reply TEXT REFERENCES mock_bank_replies
+);
+CREATE UNIQUE INDEX IF NOT EXISTS open_bank_review ON bank_result_reviews(instruction_id) WHERE decision IS NULL;
+CREATE TABLE IF NOT EXISTS reversed_mock_debits (
+    review_id INTEGER PRIMARY KEY REFERENCES bank_result_reviews, instruction_id INTEGER NOT NULL,
+    reply_id TEXT NOT NULL, amount INTEGER NOT NULL, paid_on TEXT NOT NULL, balance_id INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO bank_result_reviews(instruction_id,opened_by_reply)
+SELECT t.instruction_id,r.reply_id FROM mock_payment_attempts t JOIN mock_bank_replies r USING(attempt_id)
+WHERE EXISTS (SELECT 1 FROM mock_bank_replies earlier WHERE earlier.attempt_id=r.attempt_id
+              AND earlier.rowid<r.rowid AND earlier.result<>r.result)
+  AND NOT EXISTS (SELECT 1 FROM bank_result_reviews b WHERE b.instruction_id=t.instruction_id)
+ORDER BY r.rowid;
+UPDATE payment_instructions SET state='review' WHERE state!='completed' AND instruction_id IN (
+    SELECT instruction_id FROM bank_result_reviews WHERE decision IS NULL
+);
+"""
+
+
+def _open_bank_review(db, instruction_id):
+    return db.execute("""SELECT * FROM bank_result_reviews
+                         WHERE instruction_id=? AND decision IS NULL""", (instruction_id,)).fetchone()
 
 
 def create_instructions(db, approval_id):
@@ -182,7 +212,12 @@ def send_mock(db, actor, instruction_id, expected_attempt=None):
     with db:
         db.execute("BEGIN IMMEDIATE")
         order = _instruction(db, instruction_id)
+        if _open_bank_review(db, instruction_id):
+            raise ValueError("은행 회신이 상충합니다. 회계가 모든 시도의 결과를 확인할 때까지 전송할 수 없습니다.")
+        if amount_reviews.has_open_issue(db, order["rebate_id"]):
+            raise ValueError("정산 원본 불일치로 지급 보류 상태입니다. 월 정산 접수에서 입력값과 근거를 확인하세요.")
         _check_dispatch_allowed(db, instruction_id)
+        monthly_basis.check_dispatch(db, instruction_id)
         if db.execute(_ACCOUNT_RECHECKS_DUE + " AND t.instruction_id=? LIMIT 1", (instruction_id,)).fetchone():
             raise ValueError("등록계좌가 정정되었습니다. 회계에서 수취계좌와 증빙을 다시 확인해야 합니다.")
         if order["state"] == "held" or not order["account"]:
@@ -240,12 +275,78 @@ def _compare_reply(attempt, amount, account, result):
     return "matched", "completed", "금액·수취계좌 일치, 모의 은행 성공 확인."
 
 
+def _conflicting_reply(db, attempt, result):
+    # A treasury decision covers exactly the evidence it saw. A later report for
+    # any reviewed attempt can reopen the inquiry. A new attempt starts independently.
+    reviewed = db.execute(
+        """SELECT b.decision, success.attempt_id AS paid_attempt FROM bank_result_reviews b
+           LEFT JOIN mock_bank_replies success ON success.reply_id=b.success_reply
+           WHERE b.instruction_id=? AND b.decision IS NOT NULL AND b.through_sequence>=?
+           ORDER BY b.review_id DESC LIMIT 1""", (attempt["instruction_id"], attempt["sequence_no"]),
+    ).fetchone()
+    if reviewed:
+        confirmed_paid = reviewed["decision"] == "completed" and reviewed["paid_attempt"] == attempt["attempt_id"]
+        return confirmed_paid != (result == "success")
+    return bool(db.execute("SELECT 1 FROM mock_bank_replies WHERE attempt_id=? AND result<>? LIMIT 1",
+                           (attempt["attempt_id"], result)).fetchone() or
+                (attempt["sequence_no"] < attempt["latest_sequence"] and result == "success"))
+
+
+def resolve_bank_review(db, actor, instruction_id, decision, evidence, reply_version, success_reply=""):
+    """Record treasury's conclusion for all attempts, serialized with incoming bank replies."""
+    require_role(actor, "treasury")
+    if decision not in ("completed", "retry"):
+        raise ValueError("지급 완료 또는 모든 시도 미지급 확인을 선택하세요.")
+    evidence = _text(evidence, "모든 전송 시도의 은행 조회 결과와 확인 증빙")
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        order = _instruction(db, instruction_id)
+        review = _open_bank_review(db, instruction_id)
+        if not review:
+            raise ValueError("회계 확인을 기다리는 상충 회신이 없습니다.")
+        replies = db.execute(
+            """SELECT r.*, r.rowid AS version,t.amount_krw AS sent_amount,t.account AS sent_account
+               FROM mock_payment_attempts t JOIN mock_bank_replies r USING(attempt_id)
+               WHERE t.instruction_id=? ORDER BY r.rowid""", (instruction_id,),
+        ).fetchall()
+        version = replies[-1]["version"]
+        if str(version) != str(reply_version):
+            raise ValueError("은행 회신이 바뀌었습니다. 모든 시도와 최신 회신을 다시 확인하세요.")
+        if decision == "completed":
+            proof = next((r for r in replies if r["reply_id"] == success_reply), None)
+            if not proof or proof["result"] != "success" or proof["amount_krw"] != proof["sent_amount"] or (
+                    account_key(proof["account"]) != account_key(proof["sent_account"])):
+                raise ValueError("기존 시도의 금액과 수취계좌가 일치하는 성공 회신을 선택하세요.")
+            if proof["amount_krw"] != order["amount_krw"]:
+                raise ValueError("선택한 과거 시도의 지급액과 현재 승인 전액이 다릅니다. 은행 증빙과 승인 금액을 확인하세요.")
+        else:
+            success_reply = None
+        db.execute(
+            """UPDATE bank_result_reviews SET decision=?, evidence=?, reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP,
+                      through_reply=?, through_sequence=(SELECT MAX(sequence_no) FROM mock_payment_attempts
+                      WHERE instruction_id=?), success_reply=? WHERE review_id=?""",
+            (decision, evidence, actor.user_id, version, instruction_id, success_reply, review["review_id"]),
+        )
+        state = "completed" if decision == "completed" else "failed"
+        if order["state"] == "completed" and state == "failed":
+            funding.reverse_mock_debit(db, actor, instruction_id, review["review_id"])
+            db.execute("UPDATE payment_instructions SET state='review' WHERE instruction_id=?", (instruction_id,))
+            funding.reconcile_mock(db, actor, instruction_id, review["opened_by_reply"], "review")
+        if order["state"] != "completed" and state == "completed":
+            funding.reconcile_mock(db, actor, instruction_id, success_reply, "completed")
+        db.execute("UPDATE payment_instructions SET state=? WHERE instruction_id=?", (state, instruction_id))
+        # A registration correction may have been attached to any of these attempts.
+        for attempt in db.execute("SELECT * FROM mock_payment_attempts WHERE instruction_id=?", (instruction_id,)):
+            _record_correction_followup(db, attempt, state, f"회계 확인 #{review['review_id']}", actor)
+
+
 def _record_correction_followup(db, attempt, state, reply_id, actor):
     # Keep a resolved bank inquiry and its follow-up as separate auditable tasks.
     tasks = db.execute(
-        """SELECT * FROM correction_tasks WHERE attempt_id=? AND kind IN ('bank_check','reapproval')
-           AND (status='open' OR (kind='reapproval' AND reapproval_id IS NOT NULL))
-           ORDER BY task_id""", (attempt["attempt_id"],),
+        """SELECT * FROM correction_tasks WHERE attempt_id=? AND (
+             (kind IN ('bank_check','reapproval') AND (status='open' OR reapproval_id IS NOT NULL))
+             OR (kind='post_review' AND ?='failed'))
+           ORDER BY task_id""", (attempt["attempt_id"], state),
     ).fetchall()
     if not tasks:
         return
@@ -294,19 +395,32 @@ def record_reply(db, actor, reply_id, attempt_id, amount, account, result):
                 raise ValueError("같은 회신 번호에 다른 내용이 등록되어 있습니다. 입력값을 확인하세요.")
             return prior["outcome"]
         attempt = db.execute(
-            """SELECT t.*, i.state,
+            """SELECT t.*, i.state, i.amount_krw AS current_amount,
                       (SELECT MAX(sequence_no) FROM mock_payment_attempts
                        WHERE instruction_id=t.instruction_id) AS latest_sequence
                FROM mock_payment_attempts t JOIN payment_instructions i USING(instruction_id)
                WHERE attempt_id=?""", (attempt_id,),
         ).fetchone()
         outcome, state, reason = _compare_reply(attempt, amount, account, result)
+        needs_review = attempt is not None and (
+            _open_bank_review(db, attempt["instruction_id"]) or _conflicting_reply(db, attempt, result)
+            or (result == "success" and attempt["amount_krw"] != attempt["current_amount"]))
+        if needs_review:
+            matches = amount == attempt["amount_krw"] and account_key(account) == account_key(attempt["account"])
+            comparison = "금액·수취계좌 일치" if matches else "금액·수취계좌 불일치"
+            outcome = "review"
+            state = None if attempt["state"] == "completed" else "review"
+            reason = f"{comparison} · 상충 회신 보류. 회계가 모든 시도의 결과를 확인해야 합니다."
         db.execute(
             """INSERT INTO mock_bank_replies
                       (reply_id,attempt_id,amount_krw,account,result,outcome,reason,received_by)
                VALUES (?,?,?,?,?,?,?,?)""",
             (reply_id, attempt_id, amount, account, result, outcome, reason, actor.user_id),
         )
+        if needs_review:
+            db.execute("""INSERT INTO bank_result_reviews(instruction_id,opened_by_reply) VALUES(?,?)
+                          ON CONFLICT(instruction_id) WHERE decision IS NULL DO NOTHING""",
+                       (attempt["instruction_id"], reply_id))
         if state:
             funding.reconcile_mock(db, actor, attempt["instruction_id"], reply_id, state)
             db.execute("UPDATE payment_instructions SET state=? WHERE instruction_id=?",
@@ -320,7 +434,8 @@ def list_payments(db, month):
     db.execute("SAVEPOINT payment_view")
     try:
         orders = [
-            dict(row, attempts=[], replies=[], latest_attempt=None, queue_state=row["state"],
+            dict(row, attempts=[], replies=[], latest_attempt=None, queue_state=row["state"], bank_reviews=[],
+                 bank_conflict=False, reply_version=0,
                  correction_tasks=[], account_rechecks=[], post_review=False, effective_approval_id=row["approval_id"])
             for row in db.execute(
                 """SELECT i.*, a.period_ym, g.agency_name FROM payment_instructions i
@@ -357,14 +472,37 @@ def list_payments(db, month):
             order["attempts"].append(dict(attempt))
             order["latest_attempt"] = attempt["attempt_id"]
         for reply in db.execute(
-            """SELECT r.*, t.instruction_id FROM mock_bank_replies r JOIN mock_payment_attempts t USING(attempt_id)
+            """SELECT r.*, r.rowid AS version,t.instruction_id, t.amount_krw AS sent_amount,t.account AS sent_account
+               FROM mock_bank_replies r JOIN mock_payment_attempts t USING(attempt_id)
                JOIN payment_instructions i USING(instruction_id) JOIN approvals a USING(approval_id)
-               WHERE a.period_ym=? ORDER BY r.received_at, r.rowid""", (month,),
+               WHERE a.period_ym=? ORDER BY r.rowid""", (month,),
         ):
-            by_order[reply["instruction_id"]]["replies"].append(dict(reply))
+            order = by_order[reply["instruction_id"]]
+            order["reply_version"] = reply["version"]
+            order["replies"].append(dict(reply, confirmed_success=reply["result"] == "success" and
+                                         reply["amount_krw"] == reply["sent_amount"] and
+                                         reply["amount_krw"] == order["amount_krw"] and
+                                         account_key(reply["account"]) == account_key(reply["sent_account"])))
+        for review in db.execute(
+            """SELECT b.* FROM bank_result_reviews b JOIN payment_instructions i USING(instruction_id)
+               JOIN approvals a USING(approval_id) WHERE a.period_ym=? ORDER BY review_id""", (month,),
+        ):
+            order = by_order[review["instruction_id"]]
+            order["bank_reviews"].append(dict(review))
+            if review["decision"] is None:
+                order["bank_conflict"] = True
+                order["queue_state"] = "bank_check"
         unmatched = [dict(row) for row in db.execute(
             "SELECT * FROM mock_bank_replies WHERE outcome='unmatched' ORDER BY received_at DESC, rowid DESC"
         )]
+        monthly_basis.annotate_orders(db, month, orders)
+        unresolved = {row[0] for row in db.execute(
+            "SELECT DISTINCT rebate_id FROM open_intake_issues WHERE period_ym=?", (month,)
+        )}
+        for order in orders:
+            order["source_hold"] = order["rebate_id"] in unresolved
+            if order["source_hold"] and order["queue_state"] in ("held", "ready", "failed"):
+                order["queue_state"] = "source_review"
         return {"orders": orders, "unmatched": unmatched}
     finally:
         db.execute("RELEASE payment_view")

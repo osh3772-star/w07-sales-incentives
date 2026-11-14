@@ -1,7 +1,7 @@
 {% extends "work_base.html" %}
 {% set title = '월 정산 접수' %}
 {% set section = 'index' %}
-{% from 'work_forms.html' import money, period, feedback_box, links with context %}
+{% from 'work_forms.html' import money, period, feedback_box, links, fields, role_label, time with context %}
 {% block scripts %}<script defer src="{{ url_for('static', filename='intake.js') }}"></script>{% endblock %}
 {% block body %}
 {% macro path_tag(authority) -%}
@@ -88,6 +88,35 @@
     <ul>{% for issue in overview.issues %}<li><strong>{{ issue.rebate_id }}</strong> {{ issue.reason }}</li>{% endfor %}</ul>
   </details>
   {% endif %}
+  {% for review in amount_reviews %}
+  <details class="record-detail" {% if review.open %}open{% endif %}>
+    <summary>{{ review.rebate_id }} · {{ '금액 확인 대기' if review.open else '금액 판단 이력' }}</summary>
+    <p>최초 원장 {{ money(review.original) }}원 · 현재 심사 기준 {{ money(review.effective) }}원</p>
+    {% if review.paid is not none and review.paid != review.effective %}
+    <p class="attention">기지급 기록 {{ money(review.paid) }}원과 확정액에 차이가 있습니다. 회계에서 지급 증빙을 대조하세요. 기존 지급 건은 월 누계에 기지급액으로 반영됩니다.</p>
+    {% endif %}
+    <ul>
+      {% for entry in review.inputs %}
+      <li>추가 입력 {{ money(entry.amount) }}원 · {{ '확인 대기' if entry.decision_id is none else '판단 #' ~ entry.decision_id }}
+        {% if entry.original_sales != entry.reported_sales %} · 매출 실적 {{ money(entry.original_sales) }}원 → {{ money(entry.reported_sales) }}원{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% if review.open and actor.role in ('staff','lead') %}
+    <form method="post" action="/intake/{{ review.rebate_id|urlencode }}/resolve-amount" class="form-stack">
+      {{ fields() }}
+      <input type="hidden" name="expected_input" value="{{ review.inputs|length }}">
+      <label>확정 금액(원)<input type="number" name="amount" min="0" step="1" required></label>
+      <label>판단 근거<textarea name="reason" required></textarea></label>
+      <button class="secondary">확정 금액 기록</button>
+    </form>
+    {% endif %}
+    {% for decision in review.decisions %}
+    <p>판단 #{{ decision.decision_id }} · {{ money(decision.previous_amount) }}원 → {{ money(decision.confirmed_amount) }}원
+       · {{ decision.reason }} · {{ role_label(decision.decided_by) }} · {{ time(decision.decided_at) }}</p>
+    {% endfor %}
+  </details>
+  {% endfor %}
   <section class="ledger" aria-labelledby="ledger-title">
     <div class="ledger-header">
       <div class="ledger-title"><h2 id="ledger-title">대리점별 정산 내역</h2><span class="count">{{ stats.source_count }}건</span></div>

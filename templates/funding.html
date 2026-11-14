@@ -4,7 +4,7 @@
 {% set identity_next = '/payments/plan' %}
 {% from 'work_forms.html' import fields, feedback_box, money, role_label, time with context %}
 {% set treasury = actor.role == 'treasury' %}
-{% set states = {'held':'수취계좌 미확인','ready':'계좌 확인 완료','failed':'은행 실패 확정','sent':'은행 회신 대기','review':'대사 확인 중','completed':'대사 완료','bank_check':'기존 은행 결과 확인','reapproval':'정정 재승인 대기','account_recheck':'계좌 재확인'} %}
+{% set states = {'held':'수취계좌 미확인','ready':'계좌 확인 완료','failed':'은행 실패 확정','sent':'은행 회신 대기','review':'대사 확인 중','completed':'대사 완료','bank_check':'기존 은행 결과 확인','reapproval':'정정 재승인 대기','account_recheck':'계좌 재확인','basis_review':'월 명세 재승인 대기','source_review':'정산 원본 불일치'} %}
 {% macro deposit_fields(proposal_id=none) %}
   {{ fields() }}
   {% if proposal_id %}<input type="hidden" name="proposal_id" value="{{ proposal_id }}">{% endif %}

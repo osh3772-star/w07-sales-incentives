@@ -128,6 +128,7 @@ def _scope(db, month, group_id, kind, rebate_id, previous_id):
     notices = _applicable_corrections(db, month, group["members"])
     if notices:
         context["registration_changes"] = notices
+    if notices or tasks.intersection(r["rebate_id"] for r in rows):
         reconsidered = [r for r in rows if r["rebate_id"] in tasks and r["bucket"] == "approved_amount"]
         context["reapproval_rebate_ids"] = [r["rebate_id"] for r in reconsidered]
         context["reapproval_amount_krw"] = sum(r["amount"] for r in reconsidered)

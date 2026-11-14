@@ -5,6 +5,7 @@ from contextlib import closing
 from pathlib import Path
 
 from approvals import decide_approval, list_approvals, list_cases, reply_case, request_case, resolve_case, submit_approval
+from payments import confirm_account, list_payments, record_reply, send_mock
 from rules import month_overview
 from store import open_db, receive_month, sync_sources
 from workflow_security import USERS
@@ -75,12 +76,20 @@ class ApprovalTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             self.assertEqual(list(pool.map(approve, range(2))), [first, first])
         self.assertEqual(self.group("D-001")["approved_amount"], 988_932)
+        order = self.db.execute("SELECT instruction_id FROM payment_instructions WHERE rebate_id='RB-00006'").fetchone()[0]
+        confirm_account(self.db, TREASURY, order, "시험은행 777-001", "확인서")
         self.add_new_rebate(1_100_000)
         receive_month(self.db, JUNE)
+        with closing(open_db(self.path)) as reopened:
+            with self.assertRaisesRegex(ValueError, "2,088,932"):
+                send_mock(reopened, TREASURY, order)
+            self.assertEqual(list_payments(reopened, JUNE)["orders"][0]["queue_state"], "basis_review")
+            self.assertEqual(reopened.execute("SELECT count(*) FROM mock_payment_attempts").fetchone()[0], 0)
         second = submit_approval(self.db, STAFF, JUNE, "D-001", "추가 접수 건")
         [second_saved, first_saved] = list_approvals(self.db, JUNE)
         self.assertEqual(second_saved["monthly_total"], 2_088_932)
         self.assertEqual(second_saved["new_amount"], 1_100_000)
+        self.assertEqual(second_saved["snapshot"]["reapproval_amount"], 988_932)
         self.assertEqual(first_saved["monthly_total"], 988_932)
         self.assertEqual(second_saved["authority"], "영업임원")
         with self.assertRaises(PermissionError):
@@ -90,6 +99,56 @@ class ApprovalTests(unittest.TestCase):
             "SELECT approval_id, rebate_id FROM payment_instructions ORDER BY approval_id"
         )]
         self.assertEqual(orders, [(first, "RB-00006"), (second, "DEMO-NEW")])
+        rebound = next(i for i in list_payments(self.db, JUNE)["orders"] if i["instruction_id"] == order)
+        self.assertEqual((rebound["queue_state"], rebound["effective_approval_id"]), ("ready", second))
+        attempt = send_mock(self.db, TREASURY, order)
+        self.assertEqual(record_reply(self.db, TREASURY, "추가신청-재승인-대사", attempt, 988_932,
+                                      "시험은행 777-001", "success"), "matched")
+
+    def test_monthly_basis_scoped_to_group_and_period(self):
+        self.db.execute("""INSERT INTO rebates VALUES('JULY-TEST','D-001','2026-07',10000000,321000,
+                                                    '미지급','NONE','NONE',NULL)""")
+        receive_month(self.db, "2026-07")
+        for month, group, actor in ((JUNE, "D-001", LEAD), (JUNE, "D-011", EXEC), ("2026-07", "D-001", LEAD)):
+            aid = submit_approval(self.db, STAFF, month, group, "유효한 명세")
+            decide_approval(self.db, actor, aid, "approve", "금액 확인")
+        self.add_new_rebate(1_100_000)
+        receive_month(self.db, JUNE)
+        for month, rid in ((JUNE, "RB-00054"), ("2026-07", "JULY-TEST")):
+            order = next(o for o in list_payments(self.db, month)["orders"] if o["rebate_id"] == rid)
+            self.assertIsNone(order["monthly_hold"])
+            iid = order["instruction_id"]
+            confirm_account(self.db, TREASURY, iid, "시험은행 123-123", "시연 확인서")
+            self.assertTrue(send_mock(self.db, TREASURY, iid))
+
+    def test_pending_bank_result_after_new_intake_and_executive_approval(self):
+        first = submit_approval(self.db, STAFF, JUNE, "D-001", "단독 건")
+        decide_approval(self.db, LEAD, first, "approve", "6월 전결")
+        order = list_payments(self.db, JUNE)["orders"][0]["instruction_id"]
+        account = "시험은행 777-001"
+        confirm_account(self.db, TREASURY, order, account, "확인서")
+        attempt = send_mock(self.db, TREASURY, order)
+        self.add_new_rebate(1_100_000)
+        receive_month(self.db, JUNE)
+        second = submit_approval(self.db, STAFF, JUNE, "D-001", "추가 접수 건")
+        decide_approval(self.db, EXEC, second, "approve", "월 누계 검토")
+        self.assertNotIn("reapproval_amount", list_approvals(self.db, JUNE)[0]["snapshot"])
+        with self.assertRaisesRegex(ValueError, "은행 결과"):
+            send_mock(self.db, TREASURY, order, attempt)
+        self.assertEqual(record_reply(self.db, TREASURY, "미지급-확정", attempt, 988_932, account, "failure"),
+                         "failed")
+        with self.assertRaisesRegex(ValueError, "재승인"):
+            send_mock(self.db, TREASURY, order, attempt)
+        third = submit_approval(self.db, STAFF, JUNE, "D-001", "미집행 확인 후 재심사")
+        decide_approval(self.db, EXEC, third, "approve", "기승인분 재승인")
+        doc = list_approvals(self.db, JUNE)[0]
+        self.assertEqual((doc["monthly_total"], doc["new_amount"], doc["snapshot"]["reapproval_amount"]),
+                         (2_088_932, 0, 988_932))
+        new_attempt = send_mock(self.db, TREASURY, order, attempt)
+        self.assertNotEqual(attempt, new_attempt)
+        self.assertEqual(record_reply(self.db, TREASURY, "최종-성공", new_attempt, 988_932, account, "success"),
+                         "matched")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM payment_instructions").fetchone()[0], 2)
 
     def test_reject_then_supplement_and_reapply(self):
         first = submit_approval(self.db, STAFF, JUNE, "D-001", "접수 서류")

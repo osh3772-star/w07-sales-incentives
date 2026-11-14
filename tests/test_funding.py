@@ -1,3 +1,5 @@
+import csv
+import shutil
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -6,10 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import funding
+from amount_reviews import resolve_amount
 from app import SOURCE_ROOT, create_app
 from approvals import decide_approval, submit_approval
 from corrections import apply_correction
-from payments import confirm_account, record_reply, send_mock
+from payments import confirm_account, list_payments, record_reply, resolve_bank_review, send_mock
 from store import create_funding_database, open_db, receive_month, sync_sources
 from workflow_security import USERS
 
@@ -183,7 +186,10 @@ class FundingLedgerTest(unittest.TestCase):
             funding.schedule(self.db, TREASURY, iid, LATER, "전송 중")
         self.assertEqual(record_reply(self.db, TREASURY, "불일치", attempt, 3000, ACCOUNT, "success"), "review")
         self.assertEqual(self.balance(), (3_000_000, 2_562_561, 437_439, 888_097))
-        self.assertEqual(record_reply(self.db, TREASURY, "실패", attempt, 1_373_515, ACCOUNT, "failure"), "failed")
+        self.assertEqual(record_reply(self.db, TREASURY, "실패", attempt, 1_373_515, ACCOUNT, "failure"), "review")
+        order = next(r for r in list_payments(self.db, "2026-06")["orders"] if r["instruction_id"] == iid)
+        resolve_bank_review(self.db, TREASURY, iid, "retry", "거래번호 확인 · 미지급",
+                            order["reply_version"])
         retry = send_mock(self.db, TREASURY, iid, expected_attempt=attempt)
         self.assertNotEqual(retry, attempt)
         for _ in range(2):
@@ -228,6 +234,9 @@ class FundingLedgerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             send_mock(self.db, TREASURY, second)
         record_reply(self.db, TREASURY, "최종확인", attempt, 1_373_515, ACCOUNT, "success")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cash_mock_debits").fetchone()[0], 0)
+        order = next(r for r in list_payments(self.db, "2026-06")["orders"] if r["instruction_id"] == first)
+        resolve_bank_review(self.db, TREASURY, first, "completed", "회계 지급확인서", order["reply_version"], "최종확인")
         final = funding.overview(self.db)
         self.assertEqual((final["confirmed"], final["reserved"], final["free"]), (0, 1_189_046, 0))
 
@@ -244,3 +253,100 @@ class FundingLedgerTest(unittest.TestCase):
         active = funding.overview(self.db)["lines"][0]
         self.assertTrue(active["allocated"])
         self.assertNotEqual(active["reservation_version"], token)
+
+    def test_late_first_success_then_second_failure_holds_until_treasury_decision(self):
+        self.baseline()
+        funding.allocate(self.db, TREASURY, DAY)
+        iid = self.ids[0]
+        amount = 1_373_515
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "D-011 수취계좌 확인서")
+        first = send_mock(self.db, TREASURY, iid)
+        record_reply(self.db, TREASURY, "1차 실패", first, amount, ACCOUNT, "failure")
+        second = send_mock(self.db, TREASURY, iid, first)
+        record_reply(self.db, TREASURY, "1차 뒤늦은 성공", first, amount, ACCOUNT, "success")
+        held = next(r for r in list_payments(self.db, "2026-06")["orders"] if r["instruction_id"] == iid)
+        self.assertTrue(held["bank_conflict"])
+        record_reply(self.db, TREASURY, "2차 실패", second, amount, ACCOUNT, "failure")
+        with closing(open_db(self.path)) as restarted:
+            with self.assertRaises(ValueError):
+                send_mock(restarted, TREASURY, iid, second)
+            with self.assertRaises(ValueError):
+                resolve_bank_review(restarted, TREASURY, iid, "retry", "오래된 화면", held["reply_version"])
+        held = next(r for r in list_payments(self.db, "2026-06")["orders"] if r["instruction_id"] == iid)
+        version = held["reply_version"]
+        self.assertEqual((len(held["attempts"]), len(held["replies"])), (2, 3))
+        self.assertEqual(self.balance(), (3_000_000, 2_562_561, 437_439, 888_097))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cash_mock_debits").fetchone()[0], 0)
+        with self.assertRaises(PermissionError):
+            resolve_bank_review(self.db, EXEC, iid, "retry", "미지급", version)
+        with self.assertRaises(ValueError):
+            resolve_bank_review(self.db, TREASURY, iid, "completed", "은행 확인", version, "2차 실패")
+        resolve_bank_review(self.db, TREASURY, iid, "retry", "1·2차 모두 미지급, 은행 조회 명세", version)
+        third = send_mock(self.db, TREASURY, iid, second)
+        self.assertEqual(record_reply(self.db, TREASURY, "3차 성공", third, amount, ACCOUNT, "success"), "matched")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cash_mock_debits").fetchone()[0], 1)
+
+    def test_conflict_after_completion_keeps_history_and_never_books_a_second_debit(self):
+        self.baseline()
+        funding.allocate(self.db, TREASURY, DAY)
+        iid = self.ids[0]
+        amount = 1_373_515
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "D-011 확인서")
+        first = send_mock(self.db, TREASURY, iid)
+        record_reply(self.db, TREASURY, "첫 성공", first, amount, ACCOUNT, "success")
+        record_reply(self.db, TREASURY, "상충 실패", first, amount, ACCOUNT, "failure")
+        record_reply(self.db, TREASURY, "추가 성공", first, amount, ACCOUNT, "success")
+
+        def order():
+            return next(r for r in list_payments(self.db, "2026-06")["orders"] if r["instruction_id"] == iid)
+
+        self.assertEqual((order()["state"], order()["bank_conflict"]), ("completed", True))
+        self.assertEqual(self.db.execute("SELECT sum(amount) FROM cash_mock_debits").fetchone()[0], amount)
+        resolve_bank_review(self.db, TREASURY, iid, "completed", "은행 원장에 단 한 건 지급",
+                            order()["reply_version"], "첫 성공")
+        self.assertEqual(self.db.execute("SELECT sum(amount) FROM cash_mock_debits").fetchone()[0], amount)
+        record_reply(self.db, TREASURY, "추가 실패", first, amount, ACCOUNT, "failure")
+        resolve_bank_review(self.db, TREASURY, iid, "retry", "첫 이체가 취소되어 최종 미지급",
+                            order()["reply_version"])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cash_mock_debits").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT sum(amount) FROM reversed_mock_debits").fetchone()[0], amount)
+        self.assertEqual(self.balance(), (3_000_000, 2_562_561, 437_439, 888_097))
+        second = send_mock(self.db, TREASURY, iid, first)
+        record_reply(self.db, TREASURY, "재송금 성공", second, amount, ACCOUNT, "success")
+        self.assertEqual(self.db.execute("SELECT sum(amount) FROM cash_mock_debits").fetchone()[0], amount)
+
+    def test_prior_amount_success_cannot_complete_reapproved_larger_order(self):
+        version = submit_approval(self.db, STAFF, "2026-06", "D-001", "단건 전결")
+        decide_approval(self.db, USERS["lead"], version, "approve", "988,932원 확인")
+        iid = self.db.execute("SELECT instruction_id FROM payment_instructions WHERE rebate_id='RB-00006'").fetchone()[0]
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "D-001 확인서")
+        self.baseline(6_000_000)
+        funding.schedule(self.db, TREASURY, iid, DAY, "지급 예정")
+        funding.allocate(self.db, TREASURY, DAY)
+        first = send_mock(self.db, TREASURY, iid)
+        record_reply(self.db, TREASURY, "OLD-FAIL", first, 988_932, ACCOUNT, "failure")
+        source = self.path.parent / "source"
+        shutil.copytree(SOURCE_ROOT, source)
+        ledger = source / "sales/sales_rebate_payment_cv.csv"
+        with ledger.open(encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file, delimiter="|")
+            changed = next(r for r in reader if r["rebate_id"] == "RB-00006")
+        changed["rebate_amount_krw"] = "1200000"
+        with ledger.open("a", encoding="utf-8", newline="") as file:
+            csv.DictWriter(file, fieldnames=list(changed), delimiter="|").writerow(changed)
+        sync_sources(self.db, source)
+        resolve_amount(self.db, STAFF, "RB-00006", 1_200_000, "원금 정정 확인서", 1)
+        revised = submit_approval(self.db, STAFF, "2026-06", "D-001", "최신 금액 재상신")
+        decide_approval(self.db, USERS["lead"], revised, "approve", "1,200,000원 확정")
+        funding.allocate(self.db, TREASURY, DAY)
+        second = send_mock(self.db, TREASURY, iid, first)
+        record_reply(self.db, TREASURY, "OLD-OK", first, 988_932, ACCOUNT, "success")
+        record_reply(self.db, TREASURY, "NEW-OK", second, 1_200_000, ACCOUNT, "success")
+        order = next(r for r in list_payments(self.db, "2026-06")["orders"] if r["instruction_id"] == iid)
+        with self.assertRaisesRegex(ValueError, "현재 승인 전액"):
+            resolve_bank_review(self.db, TREASURY, iid, "completed", "과거 성공을 선택", order["reply_version"], "OLD-OK")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cash_mock_debits").fetchone()[0], 0)
+        resolve_bank_review(self.db, TREASURY, iid, "completed", "은행 확인 · 새 지급액 1회 출금",
+                            order["reply_version"], "NEW-OK")
+        self.assertEqual(tuple(self.db.execute("SELECT count(*),sum(amount) FROM cash_mock_debits").fetchone()),
+                         (1, 1_200_000))

@@ -33,6 +33,7 @@
     {% for endpoint, label in [('index','월 정산 접수'),('cases','관련자·소명'),('approvals','그룹 결재'),('payments','지급지시·대사')] %}
     <a href="{{ url_for(endpoint, month=month, group=selected_group if endpoint != 'index' else none) }}"{% if section == endpoint %} aria-current="page"{% endif %}>{{ label }}</a>
     {% endfor %}
+    <a class="guide-nav" href="{{ url_for('guide', month=month, group=selected_group) }}"{% if section == 'guide' %} aria-current="page"{% endif %}>사용 설명</a>
   </div>
 </nav>
 <main class="frame" id="main">

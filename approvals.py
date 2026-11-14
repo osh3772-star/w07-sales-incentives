@@ -4,6 +4,7 @@ import json
 from contextlib import contextmanager
 from datetime import date
 
+import monthly_basis
 from payments import authorize_corrected_orders, create_instructions
 from rules import authority_for, effective_agencies, month_overview, registered_groups
 from workflow_security import require_role
@@ -70,7 +71,7 @@ def request_case(db, actor, rebate_id, question, required=True, due_date=""):
         if not row:
             raise ValueError("정산건을 찾을 수 없습니다.")
         target = next(r for r in month_overview(db, row["period_ym"])["rows"] if r["rebate_id"] == rebate_id)
-        review = reapproval_tasks(db, row["period_ym"]).get(rebate_id)
+        review = rebate_id in reapproval_tasks(db, row["period_ym"])
         if (not target["group_id"] or target["bucket"] == "paid_amount"
                 or (not review and (not target["intake_at"] or target["bucket"] == "approved_amount"))):
             raise ValueError("접수 후 심사 중인 정산건에서 소명을 요청하세요.")
@@ -138,6 +139,13 @@ def correction_flags(db, month, target_kind):
 
 
 def reapproval_tasks(db, month):
+    """IDs of rebates currently eligible for reconsideration."""
+    return set(_registration_tasks(db, month)) | {
+        r["rebate_id"] for r in monthly_basis.open_orders(db, month) if r["queue_kind"] == "reapproval"
+    }
+
+
+def _registration_tasks(db, month):
     by_rebate = {}
     for task in db.execute(
         """SELECT task_id, rebate_id FROM correction_tasks
@@ -165,17 +173,22 @@ def list_approvals(db, month):
     result = []
     seen = set()
     flags = correction_flags(db, month, "approval")
+    changed_bases = {r[0] for r in db.execute(
+        """SELECT DISTINCT b.previous_approval_id FROM payment_basis_reviews b
+           JOIN approvals a ON a.approval_id=b.previous_approval_id WHERE a.period_ym=?""", (month,),
+    )}
     _, membership = registered_groups(effective_agencies(db, month))
     for saved in saved_versions:
         row = dict(saved)
         row["snapshot"] = json.loads(row["snapshot"])
         row["decision_snapshot"] = json.loads(row["decision_snapshot"]) if row["decision_snapshot"] else None
         row["correction_ids"] = flags.get(row["approval_id"], [])
-        row["review_required"] = bool(row["correction_ids"])
+        row["basis_changed"] = row["approval_id"] in changed_bases
+        row["review_required"] = bool(row["correction_ids"]) or row["basis_changed"]
         aliases = {membership[a] for a in row["snapshot"]["members"] if a in membership}
         row["visible_groups"] = sorted(aliases | {row["group_id"]})
         targets = [line for line in row["snapshot"]["lines"]
-                   if line["kind"] == "new" or line.get("reapproval_task_ids")]
+                   if line["kind"] == "new" or line.get("reapproval_task_ids") or line.get("basis_previous_approval_id")]
         groups = set()
         if row["status"] in ("반려", "보완 요청", "승인 대기"):
             groups.update(membership[line["agency_id"]] for line in targets if line["rebate_id"] not in seen)
@@ -197,7 +210,12 @@ def _evidence(db, month, group_id, reopen_id=None, *, require_resolved=True):
         raise ValueError("같은 그룹·월에 미접수 정산건이 있습니다. 월 접수 후 합산을 다시 확인하세요.")
     kinds = {"review_amount": "new", "paid_amount": "paid", "approved_amount": "approved"}
     source_issues = {i["rebate_id"] for i in overview["issues"]}
-    tasks = reapproval_tasks(db, month)
+    if require_resolved and any(r["rebate_id"] in source_issues and r["group_id"] == group_id
+                                for r in overview["rows"]):
+        raise ValueError("같은 그룹·월의 원본 확인 작업을 먼저 해소하고 최신 명세로 상신하세요.")
+    tasks = _registration_tasks(db, month)
+    changed = {r["rebate_id"]:r for r in monthly_basis.open_orders(db, month, group_id, overview=overview)
+               if r["queue_kind"] == "reapproval"}
     lines = []
     for row in overview["rows"]:
         if row["group_id"] != group_id:
@@ -215,8 +233,10 @@ def _evidence(db, month, group_id, reopen_id=None, *, require_resolved=True):
             })
             if kind == "approved" and row["rebate_id"] in tasks:
                 lines[-1]["reapproval_task_ids"] = tasks[row["rebate_id"]]
+            if kind == "approved" and row["rebate_id"] in changed:
+                lines[-1]["basis_previous_approval_id"] = changed[row["rebate_id"]]["effective_approval_id"]
     new_lines = [line for line in lines if line["kind"] == "new"]
-    reconsidered = [line for line in lines if line.get("reapproval_task_ids")]
+    reconsidered = [line for line in lines if line.get("reapproval_task_ids") or line.get("basis_previous_approval_id")]
     if not new_lines and not reconsidered:
         raise ValueError("이번 결재에 포함할 신규 접수 건이나 정정 재승인 건이 없습니다.")
     included_ids = {line["rebate_id"] for line in lines}
@@ -234,7 +254,7 @@ def _evidence(db, month, group_id, reopen_id=None, *, require_resolved=True):
     if reconsidered:
         evidence["reapproval_amount"] = sum(line["amount"] for line in reconsidered)
         evidence["reapproval_task_ids"] = sorted(task_id for line in reconsidered
-                                                for task_id in line["reapproval_task_ids"])
+                                                for task_id in line.get("reapproval_task_ids", []))
     memos = current_memos(db, month, group_id)
     # An unchanged pre-AI approval compares equal to its original stored evidence.
     if memos:
@@ -250,6 +270,7 @@ def submit_approval(db, actor, month, group_id, note, previous_id=None):
     require_role(actor, "staff", "lead")
     note = _text(note, "상신 사유")
     with approval_write(db):
+        monthly_basis.refresh_month(db, month)
         history = [a for a in list_approvals(db, month) if group_id in a["visible_groups"]]
         own = [a for a in history if a["group_id"] == group_id]
         pending = next((a for a in own if a["status"] == "승인 대기"), None)
@@ -316,6 +337,7 @@ def decide_approval(db, actor, approval_id, action, reason):
             (states[action], reason, _stored_json(evidence), actor.user_id, actor.role, approval_id),
         )
         if action == "approve":
+            monthly_basis.authorize(db, actor, approval_id, evidence["lines"])
             create_instructions(db, approval_id)
             if evidence.get("reapproval_task_ids"):
                 authorize_corrected_orders(db, approval_id, evidence["reapproval_task_ids"])

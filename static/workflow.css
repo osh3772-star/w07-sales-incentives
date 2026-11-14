@@ -59,6 +59,7 @@
   font-weight: 750;
 }
 .work-nav a:focus-visible { position: relative; z-index: 1; }
+.work-nav .guide-nav { margin-inline-start: auto; }
 
 .work-selector {
   display: flex;
@@ -274,6 +275,77 @@
 .funding-task { padding-block: var(--space-4); border-top: 1px solid var(--line); }
 .funding-task .form-stack { margin-block-start: var(--space-3); }
 
+/* Role guides share the workflow index, with a separate selector for the reader's role. */
+.guide-flow, .guide-roles, .guide-sheet { max-width: 58rem; }
+.guide-flow { margin-block: var(--space-4); color: var(--muted); overflow-wrap: anywhere; }
+.guide-roles {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: var(--space-2);
+  margin-block: var(--space-4) var(--space-5);
+}
+.guide-roles a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.75rem;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-action);
+  background: var(--panel);
+  color: var(--ink);
+  font-size: .9375rem;
+  text-align: center;
+  text-decoration: none;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+.guide-roles a:hover { background: var(--selected-row); }
+.guide-roles a[aria-current="page"] {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--panel);
+  font-weight: 700;
+}
+.guide-sheet {
+  padding: clamp(var(--space-5), 4vw, 3.5rem);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sheet);
+  background: var(--panel);
+  overflow-wrap: anywhere;
+}
+.guide-heading { padding-block-end: var(--space-5); border-bottom: 2px solid var(--ink); }
+.guide-heading h2 { color: var(--ink); font: 700 clamp(1.5rem, 2.25vw, 2rem)/1.35 var(--font-head); }
+.guide-heading p, .guide-steps p, .guide-handoff p, .guide-extra p {
+  max-width: 72ch;
+  margin-block-start: var(--space-2);
+  line-height: 1.75;
+}
+.guide-heading p { color: var(--muted); }
+.guide-steps { margin: 0; padding-inline-start: 2rem; list-style: decimal-leading-zero; }
+.guide-steps > li { padding: var(--space-5) 0 var(--space-5) var(--space-2); }
+.guide-steps > li + li { border-block-start: 1px solid var(--line); }
+.guide-steps > li::marker { color: var(--muted); font: 600 .9375rem var(--font-figure); }
+.guide-steps .work-link { display: inline-block; padding-block: var(--space-2); }
+.guide-handoff {
+  margin-block-start: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-inline-start: 3px solid var(--rule);
+  background: var(--surface);
+}
+.guide-extra { margin-block-start: var(--space-5); border-block-start: 1px solid var(--line); }
+.guide-extra > summary {
+  display: list-item;
+  list-style: disclosure-closed inside;
+  padding-block: var(--space-3);
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+.guide-extra[open] > summary { list-style-type: disclosure-open; }
+.guide-extra > summary::-webkit-details-marker { display: inline; }
+.guide-extra > summary:hover { text-decoration: underline; text-underline-offset: .2em; }
+
 @media (max-width: 48rem) {
   .summary.funding-summary { grid-template-columns: minmax(0,1fr); padding-block: 0; }
   .funding-summary .metric { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-2); }
@@ -292,8 +364,11 @@
   .masthead-inner { height: auto; flex-wrap: wrap; gap: var(--space-2) var(--space-4); padding-block: var(--space-3); }
   .identity-form { gap: var(--space-2); }
   .identity-form select { padding-inline-start: var(--space-2); }
-  .work-nav .frame { display: grid; grid-template-columns: repeat(4, auto); gap: 0; }
-  .work-nav a { min-height: 2.75rem; padding-inline: .125rem; font-size: .8125rem; white-space: nowrap; }
+  .work-nav .frame { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; }
+  .work-nav a { min-height: 2.75rem; min-width: 0; padding-inline: .125rem; font-size: .8125rem; overflow-wrap: anywhere; }
+  .work-nav .guide-nav { margin-inline-start: 0; }
+  .guide-roles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .guide-roles a { padding-inline: var(--space-2); }
   .work-selector { gap: var(--space-3); }
   .work-selector label:nth-of-type(2) { flex: 1 1 12rem; }
   .group-meta, .input-pair { grid-template-columns: minmax(0, 1fr); }
@@ -307,15 +382,13 @@
   .order-content { padding: var(--space-3); }
 }
 @media (max-width: 31rem) {
+  .work-nav .frame { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .work-nav a { margin-bottom: 0; }
   .amount-pair { grid-template-columns: minmax(0, 1fr); }
   .amount-pair > div { padding: var(--space-3) var(--space-4); }
   .amount-pair > div + div { border-inline-start: 0; border-top: 1px solid var(--line); }
 }
-@media (max-width: 21rem) {
-  .work-nav .frame { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .work-nav a { margin-bottom: 0; }
-}
 @media (forced-colors: active) {
   .identity-form select, .work-selector select, .form-stack select { appearance: auto; padding-inline-end: var(--space-2); background-image: none; }
-  .work-nav a[aria-current="page"] { text-decoration: underline; }
+  :is(.work-nav, .guide-roles) a[aria-current="page"] { text-decoration: underline; }
 }

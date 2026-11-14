@@ -113,7 +113,8 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
         # Reference lines on later applications do not change an earlier decision.
         applications = {
             row["rebate_id"]: row for row in db.execute(
-                """SELECT l.rebate_id, a.approval_id, a.status, p.state AS payment_state
+                """SELECT l.rebate_id, a.approval_id, a.status, p.state AS payment_state,
+                          p.amount_krw AS payment_amount
                    FROM approvals a JOIN approval_lines l USING (approval_id)
                    LEFT JOIN payment_instructions p ON p.rebate_id=l.rebate_id
                    WHERE a.period_ym=? AND l.kind='new' ORDER BY a.approval_id""",
@@ -121,7 +122,7 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
             )
         }
         rebates = db.execute(
-            "SELECT * FROM rebates WHERE period_ym = ? ORDER BY agency_id, rebate_id", (month,)
+            "SELECT * FROM effective_rebates WHERE period_ym = ? ORDER BY agency_id, rebate_id", (month,)
         ).fetchall()
         deposits = db.execute(
             """SELECT agency_id, deposit_id, bank_account_no FROM deposits
@@ -130,7 +131,7 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
         ).fetchall()
         issues = [
             dict(row) for row in db.execute(
-                """SELECT DISTINCT rebate_id, reason FROM intake_issues
+                """SELECT DISTINCT rebate_id, reason FROM open_intake_issues
                    WHERE period_ym = ? ORDER BY rebate_id, reason""",
                 (month,),
             )
@@ -177,6 +178,10 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
             elif bucket == "review_amount":
                 state = decision
         amount = rebate["rebate_amount_krw"]
+        if bucket == "paid_amount":
+            amount = rebate["source_amount_krw"]
+            if application and application["payment_state"] == "completed":
+                amount = application["payment_amount"]
         group_id = membership.get(agency_id)
         if group_id and group_id not in groups:
             groups[group_id] = {
@@ -197,7 +202,7 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
 
         if eligible and rebate["approval_status"] == "미지급":
             unpaid_count += 1
-            unpaid_amount += amount
+            unpaid_amount += rebate["source_amount_krw"]
         if bucket == "pending_amount":
             pending_count += 1
         if rebate["intake_at"]:

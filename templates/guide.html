@@ -1,0 +1,55 @@
+{% extends 'work_base.html' %}
+{% set section = 'guide' %}
+{% set title = '사용 설명' %}
+{% from 'work_forms.html' import feedback_box with context %}
+{% macro screen(endpoint, label) -%}
+  <a class="work-link" href="{{ url_for(endpoint, month=month, group=selected_group if endpoint not in ('index', 'payment_plan') else none) }}">{{ label }}</a>
+{%- endmacro %}
+{% block body %}
+<section class="intro">
+  <hgroup><h1>사용 설명</h1><p>영업지원이 월 정산을 접수하면 권한자가 관련 대리점 그룹별로 결재하고, 회계·자금이 대리점별 지급 결과를 확인합니다.</p></hgroup>
+</section>
+{{ feedback_box() }}
+<nav class="guide-roles" aria-label="역할별 사용 설명">
+  {% for user in users %}
+    <a href="{{ url_for('guide', role=user.role, month=month, group=selected_group) }}"{% if user.role == guide_user.role %} aria-current="page"{% endif %}>{{ user.label }}</a>
+  {% endfor %}
+</nav>
+<p class="guide-flow">현재 담당자는 <strong>{{ actor.label }}</strong>입니다. 위 목록에서는 다른 역할의 설명을 읽을 수 있습니다. 인계를 시연할 때는 화면 상단의 담당자 선택란에서 다음 담당자로 전환하세요.</p>
+<article class="guide-sheet">
+{% if guide_user.role == 'staff' %}
+  <header class="guide-heading"><h2>영업지원 담당자 · 월 정산 접수와 결재 상신</h2><p>귀속월과 대리점 한 곳을 정하세요. 그 대리점의 정산 ID를 따라가면 접수한 금액이 어느 그룹 결재에 들어가는지 설명할 수 있습니다.</p></header>
+  <ol class="guide-steps">
+    <li><h3>귀속월의 미지급 건을 접수합니다</h3><p>{{ screen('index', '월 정산 접수') }}에서 귀속월을 선택하고 미지급 장려금 합계와 건수를 확인하세요. <strong>월 정산 접수</strong>를 누른 뒤 목록에서 대리점명을 검색해 접수 상태와 예상 승인권자를 확인하세요. 이미 접수한 달은 기존 내역부터 살펴보세요.</p></li>
+    <li><h3>함께 심사할 대리점과 근거를 확인합니다</h3><p>{{ screen('cases', '관련자·소명') }}에서 그룹을 조회하세요. 대표자·주소·등록 정산계좌 중 두 항목 이상이 일치하면 직접 연결되고, 다른 대리점을 통해 연결된 곳도 같은 그룹에 포함됩니다. 회수계좌가 다르면 대리점에 사유와 증빙을 요청하세요.</p></li>
+    <li><h3>필요한 소명을 마치고 결재를 올립니다</h3><p><strong>소명 요청 기록</strong>으로 질문을 남기고, 회신을 받으면 <strong>답변 기록</strong>에 회신 주체와 내용을 입력하세요. 증빙을 검토해 <strong>소명 해소</strong>를 누릅니다. {{ screen('approvals', '그룹 결재') }}에서 그룹 월 누계와 이번 신규 요청액을 대조하고 상신 사유를 입력한 뒤 <strong>그룹 결재 상신</strong>을 누르세요.</p></li>
+  </ol>
+  <aside class="guide-handoff"><h3>결재자에게 넘길 때</h3><p>결재 이력에 <strong>승인 대기</strong>가 뜨면 귀속월·그룹·결재 번호를 전달하세요. 그룹 월 누계가 200만 원 이하면 영업지원 전결권자, 초과하면 영업임원이 결정합니다.</p></aside>
+  <details class="guide-extra"><summary>보완 요청을 받거나 근거가 바뀐 경우</summary><p>결재 이력에서 결정 사유를 읽고 소명이나 등록정보를 보완하세요. 같은 결재에서 <strong>재상신</strong>해 새 버전을 올립니다. AI 초안을 쓰는 경우 금액과 인용 근거를 먼저 검토하세요. <strong>채택하고 결재 상신</strong>을 누르면 실제 상신까지 진행됩니다.</p></details>
+{% elif guide_user.role in ('lead', 'executive') %}
+  {% set lead = guide_user.role == 'lead' %}
+  <header class="guide-heading"><h2>{{ '영업지원 전결권자 · 200만 원 이하 결재' if lead else '영업임원 · 200만 원 초과 결재' }}</h2>
+    <p>{% if lead %}영업지원이 넘긴 귀속월과 그룹을 여세요. 월 누계가 정확히 200만 원인 건까지 팀에서 전결합니다.{% else %}개별 대리점의 요청액이 작아도 관련 대리점의 월 누계를 합쳐 200만 원을 넘으면 임원 결재 대상입니다.{% endif %}</p></header>
+  <ol class="guide-steps">
+    <li><h3>{{ '팀 전결 대상인지 확인합니다' if lead else '한도를 넘은 이유를 확인합니다' }}</h3><p>{{ screen('approvals', '그룹 결재') }}에서 귀속월·그룹을 조회하고 <strong>승인 대기</strong> 건을 찾으세요. 월 누계에는 기지급액, 승인 후 미집행액, 이번 심사액이 함께 들어갑니다. {% if lead %}누계가 200만 원을 넘으면 귀속월과 그룹을 영업임원에게 전달하세요.{% else %}이번 신규 승인 요청액과 누계를 따로 짚고, 어떤 대리점의 금액을 합산했는지 설명하세요.{% endif %}</p></li>
+    <li><h3>{{ '상신한 명세와 소명 결과를 대조합니다' if lead else '그룹을 묶은 증빙과 예외를 검토합니다' }}</h3><p>결재 이력에서 <strong>결재 당시 근거 · 정산 명세</strong>를 펼치세요. {% if lead %}같은 정산 ID의 금액이 과거 지급분인지 이번 승인분인지 확인하고, 소명 답변과 검토 결과를 읽으세요.{% else %}같은 주소·대표자·등록계좌로 연결된 경로와 소명 내용을 확인하세요. 회수계좌 공유 사유가 더 필요하면 {{ screen('cases', '관련자·소명') }}에서 대리점의 답변과 증빙을 조회하세요.{% endif %}</p></li>
+    <li><h3>결정 사유를 기록합니다</h3><p>지급 근거가 충분하면 <strong>승인</strong>, 자료가 더 필요하면 필요한 증빙을 적고 <strong>보완 요청</strong>, 지급을 인정할 수 없으면 사유를 적고 <strong>반려</strong>를 누르세요. 필수 소명이 열려 있거나 상신 근거가 바뀌었다면 영업지원에 해소 또는 재상신을 요청하세요.</p></li>
+  </ol>
+  <aside class="guide-handoff"><h3>결정 후 인계</h3><p>신규 건을 승인하면 회계·자금이 대리점별 지급지시를 확인할 수 있습니다. 결재 번호와 신규 승인액을 전달하세요. 보완 요청·반려 건은 영업지원이 결정 사유를 확인합니다.</p></aside>
+  {% if lead %}<details class="guide-extra"><summary>직접 접수하거나 상신하는 경우</summary><p>전결권자는 월 정산 접수와 소명 기록, 상신도 할 수 있습니다. <a href="{{ url_for('guide', role='staff', month=month, group=selected_group) }}">영업지원 담당자의 접수·상신 절차</a>를 따라가세요.</p></details>{% endif %}
+{% else %}
+  <header class="guide-heading"><h2>회계·자금 · 승인 건 지급과 은행 대사</h2><p>영업지원에서 받은 귀속월·그룹·결재 번호와 대리점의 수취계좌 증빙을 준비하세요. 이 화면에서는 모의 지급지시와 은행 회신으로 시연합니다.</p></header>
+  <ol class="guide-steps">
+    <li><h3>지급지시와 수취계좌를 확인합니다</h3><p>{{ screen('payments', '지급지시·대사') }}에서 귀속월과 그룹을 조회하고 <strong>대리점별 지급지시</strong> 한 건을 펼치세요. 최초 결재의 대리점·금액을 대조한 뒤, 별도로 확인한 수취계좌와 증빙 참조를 입력하고 <strong>수취계좌 확인</strong>을 누르세요.</p></li>
+    {% if funding_enabled %}<li><h3>예정일의 자금을 배정합니다</h3><p>{{ screen('payment_plan', '지급계획') }}에서 대사한 기준 잔액을 저장하고 해당 지시의 지급예정일을 지정하세요. 예정일별 표에서 <strong>배정 확정</strong>을 눌러 전액 배정을 확인합니다. 잔액이 부족하면 추가 입금을 확인하거나 영업지원과 지급일을 협의하세요. 예정일이 도래하고 배정이 유효해야 전송할 수 있습니다.</p></li>{% endif %}
+    <li><h3>모의 전송 후 시도 번호를 확인합니다</h3><p>지급 화면에서 <strong>모의 지급지시 전송</strong>을 누르고 전송 이력의 시도 번호를 확인하세요. <strong>회신 대기</strong> 건은 기존 시도에 대한 은행 결과를 기다립니다.</p></li>
+    <li><h3>은행 회신을 원래 전송 시도와 대조합니다</h3><p>은행 회신 번호·처리 결과·금액·수취계좌를 입력하고 <strong>모의 회신 대사</strong>를 누르세요. 금액과 계좌가 일치하고 상충하는 회신이 없는 성공 건은 <strong>대사 완료</strong>로 표시됩니다. 같은 시도에 성공·실패가 함께 들어오면 모든 시도의 은행 결과와 증빙을 확인한 뒤 <strong>회계 확인 결과 기록</strong>을 누르세요.</p></li>
+  </ol>
+  <aside class="guide-handoff"><h3>시연을 마칠 때</h3><p>지급지시 번호와 은행 회신 번호를 함께 보여주세요. 같은 그룹의 다른 대리점도 각 지시의 상태를 확인하고, 보류·미회신 건은 후속 확인 대상으로 남기세요.</p></aside>
+  <details class="guide-extra"><summary>결과가 맞지 않거나 전송 후 정정된 경우</summary><p>금액·계좌가 다르거나 회신이 없으면 기존 시도 번호로 은행 결과를 확인하세요. 실패가 확정되고 미지급임을 확인한 건만 <strong>실패 확인 후 모의 재전송</strong>합니다. 정정 지급 보류는 영업지원에 재승인을 요청하고, 수취계좌 재확인 건은 증빙을 다시 대조하세요.</p></details>
+{% endif %}
+{% if funding_enabled and guide_user.role in ('staff', 'lead') %}
+  <details class="guide-extra"><summary>회계에서 회수 일정 또는 지급일 협의를 요청한 경우</summary><p>{{ screen('payment_plan', '지급계획') }}에서 해당 대리점과 예정일을 확인하세요. 대리점과 협의한 근거를 적고 <strong>회수 일정 확인</strong> 또는 <strong>변경 일정 합의</strong>를 누르세요. 협의가 어려우면 불가 사유를 남겨 회계가 다음 방안을 판단할 수 있게 합니다.</p></details>
+{% endif %}
+</article>
+{% endblock %}

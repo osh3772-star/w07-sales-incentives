@@ -68,7 +68,7 @@ def open_db(db_path):
     try:
         db.execute("PRAGMA foreign_keys = ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 4:
+        if version > 5:
             raise ValueError("더 최신 버전의 업무 DB입니다. 앱 버전을 확인하세요.")
         if version == 0:
             db.executescript(SCHEMA)
@@ -79,6 +79,14 @@ def open_db(db_path):
             db.executescript("BEGIN IMMEDIATE;\n" + AI_SCHEMA + "\nPRAGMA user_version = 3;\nCOMMIT;")
         if version < 4:
             db.executescript("BEGIN IMMEDIATE;\n" + CORRECTION_SCHEMA + "\nPRAGMA user_version = 4;\nCOMMIT;")
+        if version < 5:
+            from amount_reviews import SCHEMA as amount_schema
+            import funding
+            from monthly_basis import SCHEMA as basis_schema
+            from payments import BANK_REVIEW_SCHEMA
+            reserve_sql = funding.BANK_REVIEW_RESERVATIONS_SQL if funding.enabled(db) else ""
+            db.executescript("BEGIN IMMEDIATE;\n" + amount_schema + basis_schema + BANK_REVIEW_SCHEMA + reserve_sql
+                             + "\nPRAGMA user_version = 5;\nCOMMIT;")
     except Exception:
         db.close()
         raise
@@ -198,8 +206,11 @@ def sync_sources(db, source_root):
                 if existing is not None and dict(existing) != row:
                     raise ValueError(f"{filename}의 기존 ID {row[fields[0]]}와 내용이 다릅니다.")
         eligibility = dict(db.execute("SELECT agency_id, rebate_eligible FROM agencies"))
+        posted_months = set()
         for row in _rows(root / "sales/sales_rebate_payment_cv.csv", REBATE_FIELDS):
             existing = _insert_source(db, "rebates", REBATE_FIELDS, row)
+            if existing is None and row["approval_status"] == "승인":
+                posted_months.add(row["period_ym"])
             if existing is not None and dict(existing) != row:
                 reason = "같은 정산건 ID의 원본 내용이 다릅니다."
                 for period in {row["period_ym"], existing["period_ym"]}:
@@ -208,6 +219,9 @@ def sync_sources(db, source_root):
             reason = _rebate_issue(row, eligibility)
             if reason:
                 _record_issue(db, row, reason, row["period_ym"])
+        from monthly_basis import refresh_month
+        for period in posted_months:
+            refresh_month(db, period)
 
 
 def available_months(db):
@@ -225,7 +239,7 @@ def receive_month(db, period_ym):
         period_ym = ? AND approval_status = '미지급'
         AND approver IN ('NONE', '') AND payment_date IN ('NONE', '')
         AND agency_id IN (SELECT agency_id FROM agencies WHERE rebate_eligible = 1)
-        AND NOT EXISTS (SELECT 1 FROM intake_issues WHERE intake_issues.rebate_id = rebates.rebate_id)
+        AND NOT EXISTS (SELECT 1 FROM open_intake_issues i WHERE i.rebate_id = rebates.rebate_id)
     """
     with db:
         db.execute("BEGIN IMMEDIATE")
@@ -240,6 +254,8 @@ def receive_month(db, period_ym):
             (period_ym,),
         ).rowcount
         issues = db.execute(
-            "SELECT COUNT(DISTINCT rebate_id) FROM intake_issues WHERE period_ym = ?", (period_ym,)
+            "SELECT COUNT(DISTINCT rebate_id) FROM open_intake_issues WHERE period_ym = ?", (period_ym,)
         ).fetchone()[0]
+        from monthly_basis import refresh_month
+        refresh_month(db, period_ym)
     return {"added": added, "existing": existing, "issues": issues}

@@ -8,10 +8,12 @@ from pathlib import Path
 from flask import Flask, flash, get_flashed_messages, redirect, render_template, request, session, url_for
 
 import ai_drafts
+import amount_reviews
 import approvals as decisions
 import corrections
 import funding
 import funding_ai
+import monthly_basis
 import payments as settlement
 from ai_provider import ProviderError
 from rules import effective_agencies, month_overview
@@ -22,9 +24,9 @@ from workflow_security import USERS, require_role
 ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = ROOT / "01_참가자_배포용" / "04_원본데이터" / "01_corevia"
 SCREENS = {"/": "index", "/cases": "cases", "/approvals": "approvals", "/payments": "payments",
-           "/payments/plan": "payment_plan"}
+           "/payments/plan": "payment_plan", "/guide": "guide"}
 TEMPLATES = {"index": "intake.html", "cases": "cases.html", "approvals": "approvals.html",
-             "payments": "payments.html", "payment_plan": "funding.html"}
+             "payments": "payments.html", "payment_plan": "funding.html", "guide": "guide.html"}
 AI_KINDS = {"cases": ("summary", "question"), "approvals": ("proposal",)}
 
 
@@ -62,6 +64,11 @@ def create_app(database=None, source_root=SOURCE_ROOT):
                 group = next((item["group_id"] for item in groups if len(item["members"]) > 1),
                              groups[0]["group_id"])
             details = {}
+            if screen == "index" and month:
+                details["amount_reviews"] = amount_reviews.list_reviews(db, month)
+            if screen == "guide":
+                details["guide_user"] = USERS.get(request.args.get("role"), actor())
+                details["funding_enabled"] = funding.enabled(db)
             if screen in ("cases", "approvals"):
                 details["cases"] = decisions.list_cases(db, month)
                 details["ai_drafts"] = ai_drafts.list_drafts(db, month, group) if group else []
@@ -74,6 +81,7 @@ def create_app(database=None, source_root=SOURCE_ROOT):
             if screen in ("cases", "approvals", "payments"):
                 details["correction_tasks"] = corrections.list_tasks(db, month, group)
             if screen == "approvals":
+                details["basis_reviews"] = monthly_basis.open_orders(db, month, group)
                 details["approvals"] = [dict(doc, can_resubmit=group in doc["resubmittable_groups"])
                                         for doc in decisions.list_approvals(db, month)
                                         if group in doc["visible_groups"]]
@@ -100,6 +108,8 @@ def create_app(database=None, source_root=SOURCE_ROOT):
             return SCREENS.get(form("next"), "index")
         if request.path == "/payments/plan" or request.path.startswith("/payments/plan/"):
             return "payment_plan"
+        if request.path.startswith("/intake/"):
+            return "index"
         return SCREENS.get("/" + request.path.strip("/").split("/")[0], "index")
 
     @app.before_request
@@ -145,6 +155,10 @@ def create_app(database=None, source_root=SOURCE_ROOT):
     @app.get("/payments/plan")
     def payment_plan():
         return page("payment_plan", request.args.get("month"))
+
+    @app.get("/guide")
+    def guide():
+        return page("guide", request.args.get("month"), request.args.get("group"))
 
     def number(name):
         value = form(name)
@@ -225,6 +239,13 @@ def create_app(database=None, source_root=SOURCE_ROOT):
             return page("index", form("month"), error="원본 또는 DB를 읽을 수 없습니다.", status=503)
         return success(f"{form('month')} 접수 결과 · 신규 {result['added']}건 · 기존 {result['existing']}건"
                        f" · 원본 오류 확인 {result['issues']}건")
+
+    @app.post("/intake/<rebate_id>/resolve-amount")
+    def resolve_rebate_amount(rebate_id):
+        with closing(open_db(db_path)) as db:
+            amount_reviews.resolve_amount(db, actor(), rebate_id, form("amount"), form("reason"),
+                                          number("expected_input"))
+        return success("확정 금액과 판단 근거를 저장했습니다. 결재와 지급 상태를 확인하세요.", "index")
 
     @app.post("/cases/request")
     def request_case():
@@ -327,6 +348,13 @@ def create_app(database=None, source_root=SOURCE_ROOT):
         with closing(open_db(db_path)) as db:
             attempt = settlement.send_mock(db, actor(), instruction_id, form("expected_attempt") or None)
         return success(f"모의 지급 시도 {attempt}의 처리 상태를 확인하세요.")
+
+    @app.post("/payments/<int:instruction_id>/bank-review")
+    def resolve_bank_review(instruction_id):
+        with closing(open_db(db_path)) as db:
+            settlement.resolve_bank_review(db, actor(), instruction_id, form("decision"), form("evidence"),
+                                           form("reply_version"), form("success_reply"))
+        return success("은행 결과 확인 근거와 회계 결정을 기록했습니다. 지급지시의 남은 보류 사유를 확인하세요.")
 
     @app.post("/payments/reply")
     def bank_reply():
