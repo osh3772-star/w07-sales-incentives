@@ -84,7 +84,7 @@ def registered_groups(agencies):
     return groups, membership
 
 
-def _settlement_state(rebate, eligible, reasons):
+def _settlement_state(rebate, eligible):
     """Return an exclusive amount bucket and a human-readable line status."""
     status = rebate["approval_status"]
     if status in {"반려", "취소"}:
@@ -96,7 +96,7 @@ def _settlement_state(rebate, eligible, reasons):
     if status == "승인" and approved_by:
         # A disputed new copy doesn't erase a previously booked valid payment.
         return ("paid_amount", "원장상 기지급") if paid_on else ("approved_amount", "승인 후 미집행")
-    if reasons or status != "미지급" or approved_by or paid_on:
+    if status != "미지급" or approved_by or paid_on:
         return None, "확인 필요"
     if rebate["intake_at"]:
         return "review_amount", "접수 완료"
@@ -160,6 +160,7 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
 
     rows = []
     groups = {}
+    held_originals = {}
     unpaid_count = 0
     unpaid_amount = 0
     pending_count = 0
@@ -174,7 +175,11 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
         agency = registry.get(agency_id)
         eligible = bool(agency and agency["rebate_eligible"])
         reasons = issues_by_id[rebate["rebate_id"]]
-        bucket, state = _settlement_state(rebate, eligible, reasons)
+        bucket, state = _settlement_state(rebate, eligible)
+        if reasons and bucket in ("pending_amount", "review_amount"):
+            # Exclude the unresolved line from the ledger, but keep its valid original as a candidate.
+            held_originals[rebate["rebate_id"]] = rebate["rebate_amount_krw"]
+            bucket, state = None, "확인 필요"
         if application:
             decision = application["status"]
             if decision == "승인":
@@ -233,23 +238,26 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
             "notes": notes,
         })
 
-    # Each disputed ID still has one booked amount. Compare alternatives in the
-    # affected month/group without adding a second obligation to the ledger.
+    # For each ID, replace its booked contribution with exactly one candidate.
     rows_by_id = {row["rebate_id"]: row for row in rows}
     alternatives = {}
     for conflict in amount_conflicts:
-        row = rows_by_id[conflict["rebate_id"]]
+        rid = conflict["rebate_id"]
+        row = rows_by_id[rid]
         if row["state"] in ("반려", "취소"):
             continue
         booked_group = row["group_id"]
         incoming_group = membership.get(conflict["reported_agency_id"])
+        booked = row["amount"] if row["included"] else 0
+        original = booked if row["included"] else held_originals.get(rid, 0)
         for gid in {booked_group, incoming_group}:
             if gid not in groups:
                 continue
             by_rebate = alternatives.setdefault(gid, {})
-            included = row["amount"] if gid == booked_group and row["bucket"] else 0
+            included = booked if gid == booked_group else 0
+            current = original if gid == booked_group else 0
             incoming = conflict["amount"] if gid == incoming_group else 0
-            by_rebate.setdefault(row["rebate_id"], {0}).add(incoming - included)
+            by_rebate.setdefault(rid, {current - included}).add(incoming - included)
     dispute_reasons = {}
     for group in groups.values():
         group["total"] = group["paid_amount"] + group["approved_amount"] + group["review_amount"]
@@ -261,6 +269,9 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
             high = total + sum(max(deltas) for deltas in by_rebate.values())
             group["authority"] = authority_for(low) if authority_for(low) == authority_for(high) else "확정 대기"
             group["disputed_range"] = (low, high)
+            group["new_amount_unresolved"] = any(
+                rid in held_originals and not rows_by_id[rid]["included"] for rid in by_rebate
+            )
             dispute_reasons[group["group_id"]] = (
                 f"{', '.join(by_rebate)} 원본 미확정 · 그룹 월 누계 후보 {low:,}원 ~ {high:,}원. "
                 "월 정산 접수에서 대리점과 금액을 확인하세요."
@@ -271,9 +282,10 @@ def month_overview(db: sqlite3.Connection, month: str) -> dict:
         group = groups.get(row["group_id"])
         row["group_total"] = group["projected_total"] if group else 0
         row["group_applied_total"] = group["total"] if group else 0
-        row["authority"] = group["authority"] if row["included"] else "—"
+        affected = row["rebate_id"] in alternatives.get(row["group_id"], {})
+        row["authority"] = group["authority"] if row["included"] or affected else "—"
 
-    active_groups = [group for group in groups.values() if group["included_count"]]
+    active_groups = [group for group in groups.values() if group["included_count"] or "disputed_range" in group]
     stats = {
         "source_count": len(rows), "unpaid_count": unpaid_count, "unpaid_amount": unpaid_amount,
         "received_count": received_count, "pending_count": pending_count,

@@ -317,6 +317,93 @@ class FundingLedgerTest(unittest.TestCase):
         record_reply(self.db, TREASURY, "재송금 성공", second, amount, ACCOUNT, "success")
         self.assertEqual(self.db.execute("SELECT sum(amount) FROM cash_mock_debits").fetchone()[0], amount)
 
+    def test_completed_payment_mismatches_require_evidence_and_preserve_the_original_debit(self):
+        approval = submit_approval(self.db, STAFF, "2026-06", "D-001", "원본 정산서")
+        decide_approval(self.db, USERS["lead"], approval, "approve", "팀 전결")
+        iid = self.db.execute("SELECT instruction_id FROM payment_instructions WHERE rebate_id='RB-00006'").fetchone()[0]
+        self.baseline(6_000_000)
+        funding.schedule(self.db, TREASURY, iid, DAY, "확인한 지급일")
+        funding.allocate(self.db, TREASURY, DAY)
+        confirm_account(self.db, TREASURY, iid, ACCOUNT, "D-001 수취계좌 확인서")
+        attempt = send_mock(self.db, TREASURY, iid)
+        amount = 988_932
+        self.assertEqual(record_reply(self.db, TREASURY, "PAID", attempt, amount, ACCOUNT, "success"), "matched")
+        paid = self.db.execute("SELECT * FROM mock_bank_replies WHERE reply_id='PAID'").fetchone()
+        debit = self.db.execute("SELECT * FROM cash_mock_debits WHERE instruction_id=?", (iid,)).fetchone()
+        self.assertEqual((debit["reply_id"], debit["amount"]), ("PAID", amount))
+
+        def order():
+            return next(o for o in list_payments(self.db, "2026-06")["orders"] if o["instruction_id"] == iid)
+
+        record_reply(self.db, TREASURY, "PAID-COPY", attempt, amount, ACCOUNT.replace("-", ""), "success")
+        self.assertEqual(order()["bank_reviews"], [])
+        for _ in range(2):
+            record_reply(self.db, TREASURY, "AMOUNT", attempt, amount - 1, ACCOUNT, "success")
+        current = order()
+        self.assertEqual((current["state"], current["bank_conflict"], len(current["bank_reviews"])),
+                         ("completed", True, 1))
+        old_version = current["reply_version"]
+        other_account = "모의은행 1200-301"
+        for _ in range(2):
+            record_reply(self.db, TREASURY, "ACCOUNT", attempt, amount, other_account, "success")
+        current = order()
+        self.assertEqual(len(current["bank_reviews"]), 1)
+        self.assertEqual(current["bank_reviews"][0]["opened_by_reply"], "AMOUNT")
+        self.assertEqual((current["queue_state"], current["bank_review_kind"]), ("bank_check", "discrepancy"))
+        version = current["reply_version"]
+        evidence = "은행 명세서 DOC-1로 원래 수취계좌의 988,932원 1회 집행을 대조"
+        choice = dict(decision="completed", evidence=evidence, reply_version=version, success_reply="PAID")
+        review = f"/payments/{iid}/bank-review"
+
+        with running_server(self.path) as url:
+            client = Session(url)
+            self.assertEqual(client.post(review, **choice)[0], 403)
+            self.assertEqual(client.post("/identity", user_id="treasury", next="/")[0], 200)
+            status, page = client.get("/payments?month=2026-06&group=D-001")
+            self.assertEqual(status, 200)
+            self.assertIn("대사 완료 · 회계 재검토 필요", page)
+            self.assertIn(f'action="{review}"', page)
+            self.assertEqual(client.post(f"/payments/{iid}/send", expected_attempt=attempt)[0], 400)
+            for invalid in (dict(reply_version=old_version), dict(evidence=""), dict(success_reply="ACCOUNT"),
+                            dict(success_reply="AMOUNT"), dict(decision="retry")):
+                self.assertEqual(client.post(review, **{**choice, **invalid})[0], 400)
+            self.assertEqual(client.post(review, **choice)[0], 200)
+
+        with running_server(self.path) as url:
+            client = Session(url)
+            client.post("/identity", user_id="treasury", next="/")
+            self.assertEqual(client.post(review, **choice)[0], 200)
+            page = client.get("/payments?month=2026-06&group=D-001")[1]
+            self.assertIn(evidence, page)
+            self.assertIn("검토한 불일치 회신", page)
+            self.assertNotIn(f'action="{review}"', page)
+            for rid, reported, account in (("AMOUNT", amount - 1, ACCOUNT), ("ACCOUNT", amount, other_account),
+                                           ("SAME-AFTER", amount, ACCOUNT)):
+                self.assertEqual(client.post("/payments/reply", reply_id=rid, attempt_id=attempt,
+                                             amount=reported, account=account, result="success")[0], 200)
+        current = order()
+        self.assertEqual((current["state"], current["bank_conflict"], len(current["attempts"])), ("completed", False, 1))
+        decision, = current["bank_reviews"]
+        self.assertCountEqual(decision["mismatched_reply_ids"], ["AMOUNT", "ACCOUNT"])
+        self.assertEqual((decision["decision"], decision["success_reply"], decision["through_reply"],
+                          decision["reviewed_by"], decision["evidence"]), ("completed", "PAID", version, "treasury", evidence))
+        self.assertCountEqual([r["reply_id"] for r in current["replies"]],
+                              ["PAID", "PAID-COPY", "AMOUNT", "ACCOUNT", "SAME-AFTER"])
+        record_reply(self.db, TREASURY, "ACCOUNT-COPY", attempt, amount, other_account.replace("-", ""), "success")
+        current = order()
+        self.assertFalse(current["bank_conflict"])
+        self.assertEqual(len(current["bank_reviews"]), 1)
+
+        # A newly reported wrong account after the decision needs its own examination.
+        record_reply(self.db, TREASURY, "ACCOUNT-NEW", attempt, amount, "모의은행 1200-302", "success")
+        current = order()
+        self.assertTrue(current["bank_conflict"])
+        self.assertEqual(len(current["bank_reviews"]), 2)
+        self.assertEqual(sum(r["decision"] is None for r in current["bank_reviews"]), 1)
+        self.assertEqual(self.db.execute("SELECT * FROM cash_mock_debits WHERE instruction_id=?", (iid,)).fetchall(), [debit])
+        self.assertEqual(self.db.execute("SELECT * FROM mock_bank_replies WHERE reply_id='PAID'").fetchone(), paid)
+        self.assertEqual(self.balance()[0], 6_000_000 - amount)
+
     def test_treasury_changes_completed_debit_to_first_success_without_another_withdrawal(self):
         iid = self.db.execute(
             "SELECT instruction_id FROM payment_instructions WHERE agency_id='D-011'"

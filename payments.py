@@ -70,6 +70,79 @@ def _open_bank_review(db, instruction_id):
                          WHERE instruction_id=? AND decision IS NULL""", (instruction_id,)).fetchone()
 
 
+def _reply_differences(attempt, amount, account):
+    differences = []
+    if amount != attempt["amount_krw"]:
+        differences.append("금액")
+    if account_key(account) != account_key(attempt["account"]):
+        differences.append("수취계좌")
+    return differences
+
+
+def _reviewed_discrepancy(db, attempt_id, amount, account):
+    # A fresh report ID can repeat evidence already considered by treasury.
+    reports = db.execute(
+        """SELECT r.reply_id,r.account FROM bank_review_discrepancies d
+           JOIN bank_result_reviews b USING(review_id) JOIN mock_bank_replies r USING(reply_id)
+           WHERE b.decision IS NOT NULL AND r.attempt_id=? AND r.amount_krw=? AND r.result='success'
+           ORDER BY b.review_id DESC""", (attempt_id, amount),
+    )
+    key = account_key(account) or account
+    return next((r["reply_id"] for r in reports if (account_key(r["account"]) or r["account"]) == key), None)
+
+
+def _bank_task(db, instruction_id, reply_id, kind):
+    db.execute(
+        """INSERT INTO bank_result_reviews(instruction_id,opened_by_reply,review_kind) VALUES(?,?,?)
+           ON CONFLICT(instruction_id) WHERE decision IS NULL DO UPDATE SET review_kind='outcome'
+           WHERE excluded.review_kind='outcome'""", (instruction_id, reply_id, kind),
+    )
+    return _open_bank_review(db, instruction_id)["review_id"]
+
+
+def migrate_completed_discrepancies(db):
+    """Connect previously recorded late mismatches to the decision that saw them or to an open task."""
+    if "review_kind" not in {r["name"] for r in db.execute("PRAGMA table_info(bank_result_reviews)")}:
+        db.execute("""ALTER TABLE bank_result_reviews ADD COLUMN review_kind TEXT NOT NULL DEFAULT 'outcome'
+                      CHECK (review_kind IN ('outcome','discrepancy'))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS bank_review_discrepancies (
+                    reply_id TEXT PRIMARY KEY REFERENCES mock_bank_replies,
+                    review_id INTEGER NOT NULL REFERENCES bank_result_reviews)""")
+    rows = db.execute(
+        """WITH transitions(instruction_id, version, complete) AS (
+               SELECT t.instruction_id,r.rowid,1 FROM mock_bank_replies r
+               JOIN mock_payment_attempts t USING(attempt_id) WHERE r.outcome='matched'
+               UNION ALL
+               SELECT instruction_id,through_reply,decision='completed' FROM bank_result_reviews
+               WHERE decision IS NOT NULL
+           )
+           SELECT r.reply_id,r.attempt_id,r.amount_krw AS reported_amount,r.account AS reported_account,
+                  r.rowid AS version,t.instruction_id,t.amount_krw,t.account
+           FROM mock_bank_replies r JOIN mock_payment_attempts t USING(attempt_id)
+           JOIN payment_instructions i USING(instruction_id)
+           WHERE i.state='completed' AND r.result='success' AND r.outcome IN ('late','review')
+             AND (SELECT complete FROM transitions WHERE instruction_id=i.instruction_id AND version<r.rowid
+                  ORDER BY version DESC LIMIT 1)
+           ORDER BY r.rowid"""
+    ).fetchall()
+    for row in rows:
+        amount, account = row["reported_amount"], row["reported_account"]
+        if not _reply_differences(row, amount, account):
+            continue
+        # A past decision already covers replies through its saved input version.
+        decision = db.execute("""SELECT review_id FROM bank_result_reviews
+                                 WHERE instruction_id=? AND through_reply>=? ORDER BY review_id LIMIT 1""",
+                              (row["instruction_id"], row["version"])).fetchone()
+        if decision:
+            review_id = decision["review_id"]
+        elif _reviewed_discrepancy(db, row["attempt_id"], amount, account):
+            continue
+        else:
+            review_id = _bank_task(db, row["instruction_id"], row["reply_id"], "discrepancy")
+        db.execute("INSERT OR IGNORE INTO bank_review_discrepancies(reply_id,review_id) VALUES(?,?)",
+                   (row["reply_id"], review_id))
+
+
 def create_instructions(db, approval_id):
     """Run within the decision's write transaction so an approval and its orders commit together."""
     if not db.in_transaction:
@@ -256,11 +329,7 @@ def send_mock(db, actor, instruction_id, expected_attempt=None):
 def _compare_reply(attempt, amount, account, result):
     if attempt is None:
         return "unmatched", None, "지급 시도 번호를 찾을 수 없습니다."
-    differences = []
-    if amount != attempt["amount_krw"]:
-        differences.append("금액")
-    if account_key(account) != account_key(attempt["account"]):
-        differences.append("수취계좌")
+    differences = _reply_differences(attempt, amount, account)
     if differences:
         detail = "·".join(differences) + " 불일치"
     else:
@@ -329,6 +398,8 @@ def resolve_bank_review(db, actor, instruction_id, decision, evidence, reply_ver
             if order["state"] == state and previous == (decision, success_reply, evidence, actor.user_id, version):
                 return
             raise ValueError("이미 확정한 회계 결정입니다. 최신 은행 회신과 확인 이력을 조회하세요.")
+        if review["review_kind"] == "discrepancy" and decision == "retry":
+            raise ValueError("완료 후 금액·수취계좌 불일치입니다. 기존 지급 증빙을 확인하고 지급 완료 근거를 기록하세요.")
         if decision == "completed":
             proof = next((r for r in replies if r["reply_id"] == success_reply), None)
             if not proof or proof["result"] != "success" or proof["amount_krw"] != proof["sent_amount"] or (
@@ -421,26 +492,40 @@ def record_reply(db, actor, reply_id, attempt_id, amount, account, result):
                WHERE attempt_id=?""", (attempt_id,),
         ).fetchone()
         outcome, state, reason = _compare_reply(attempt, amount, account, result)
-        needs_review = attempt is not None and (
-            _open_bank_review(db, attempt["instruction_id"]) or _conflicting_reply(db, attempt, result)
-            or (result == "success" and (attempt["amount_krw"] != attempt["current_amount"]
-                                         or attempt["payee_agency_id"] != attempt["current_agency"])))
-        if needs_review:
-            matches = amount == attempt["amount_krw"] and account_key(account) == account_key(attempt["account"])
-            comparison = "금액·수취계좌 일치" if matches else "금액·수취계좌 불일치"
-            outcome = "review"
-            state = None if attempt["state"] == "completed" else "review"
-            reason = f"{comparison} · 상충 회신 보류. 회계가 모든 시도의 결과를 확인해야 합니다."
+        review_kind = None
+        late_mismatch = False
+        if attempt is not None:
+            open_review = _open_bank_review(db, attempt["instruction_id"])
+            differences = _reply_differences(attempt, amount, account)
+            late_mismatch = attempt["state"] == "completed" and result == "success" and bool(differences)
+            reviewed_copy = late_mismatch and _reviewed_discrepancy(db, attempt_id, amount, account)
+            conflict = _conflicting_reply(db, attempt, result) or (
+                result == "success" and (attempt["amount_krw"] != attempt["current_amount"]
+                                         or attempt["payee_agency_id"] != attempt["current_agency"]))
+            if reviewed_copy and not open_review and not conflict:
+                reason = f"회계가 확인한 불일치 회신 {reviewed_copy}와 같은 내용입니다."
+            elif conflict:
+                review_kind = "outcome"
+            elif late_mismatch:
+                review_kind = "discrepancy"
+            elif open_review:
+                review_kind = open_review["review_kind"]
+            if review_kind:
+                outcome = "review"
+                state = None if attempt["state"] == "completed" else "review"
+                comparison = "·".join(differences) + " 불일치" if differences else "금액·수취계좌 일치"
+                reason = f"{comparison} · 회계가 은행 회신과 지급 근거를 재검토해야 합니다."
         db.execute(
             """INSERT INTO mock_bank_replies
                       (reply_id,attempt_id,amount_krw,account,result,outcome,reason,received_by)
                VALUES (?,?,?,?,?,?,?,?)""",
             (reply_id, attempt_id, amount, account, result, outcome, reason, actor.user_id),
         )
-        if needs_review:
-            db.execute("""INSERT INTO bank_result_reviews(instruction_id,opened_by_reply) VALUES(?,?)
-                          ON CONFLICT(instruction_id) WHERE decision IS NULL DO NOTHING""",
-                       (attempt["instruction_id"], reply_id))
+        if review_kind:
+            review_id = _bank_task(db, attempt["instruction_id"], reply_id, review_kind)
+            if late_mismatch:
+                db.execute("INSERT INTO bank_review_discrepancies(reply_id,review_id) VALUES(?,?)",
+                           (reply_id, review_id))
         if state:
             funding.reconcile_mock(db, actor, attempt["instruction_id"], reply_id, state)
             db.execute("UPDATE payment_instructions SET state=? WHERE instruction_id=?",
@@ -455,7 +540,7 @@ def list_payments(db, month):
     try:
         orders = [
             dict(row, attempts=[], replies=[], latest_attempt=None, queue_state=row["state"], bank_reviews=[], debit=None,
-                 bank_conflict=False, reply_version=0,
+                 bank_conflict=False, bank_review_kind=None, reply_version=0,
                  correction_tasks=[], account_rechecks=[], payee_changes=[],
                  post_review=False, effective_approval_id=row["approval_id"])
             for row in db.execute(
@@ -514,15 +599,23 @@ def list_payments(db, month):
                                          reply["amount_krw"] == order["amount_krw"] and
                                          reply["payee_agency_id"] == order["agency_id"] and
                                          account_key(reply["account"]) == account_key(reply["sent_account"])))
+        mismatch_ids = {}
+        for mismatch in db.execute(
+            """SELECT d.* FROM bank_review_discrepancies d JOIN bank_result_reviews b USING(review_id)
+               JOIN mock_bank_replies r USING(reply_id) JOIN payment_instructions i USING(instruction_id)
+               JOIN approvals a USING(approval_id) WHERE a.period_ym=? ORDER BY r.rowid""", (month,),
+        ):
+            mismatch_ids.setdefault(mismatch["review_id"], []).append(mismatch["reply_id"])
         for review in db.execute(
             """SELECT b.*, h.previous_reply_id FROM bank_result_reviews b
                LEFT JOIN debit_evidence_changes h USING(review_id) JOIN payment_instructions i USING(instruction_id)
                JOIN approvals a USING(approval_id) WHERE a.period_ym=? ORDER BY review_id""", (month,),
         ):
             order = by_order[review["instruction_id"]]
-            order["bank_reviews"].append(dict(review))
+            order["bank_reviews"].append(dict(review, mismatched_reply_ids=mismatch_ids.get(review["review_id"], [])))
             if review["decision"] is None:
                 order["bank_conflict"] = True
+                order["bank_review_kind"] = review["review_kind"]
                 order["queue_state"] = "bank_check"
         if funding.enabled(db):
             for debit in db.execute(

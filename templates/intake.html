@@ -1,7 +1,7 @@
 {% extends "work_base.html" %}
 {% set title = '월 정산 접수' %}
 {% set section = 'index' %}
-{% from 'work_forms.html' import money, period, feedback_box, links, fields, role_label, time with context %}
+{% from 'work_forms.html' import money, monthly_amount, period, feedback_box, links, fields, role_label, time with context %}
 {% block scripts %}<script defer src="{{ url_for('static', filename='intake.js') }}"></script>{% endblock %}
 {% block body %}
 {% macro path_tag(authority) -%}
@@ -71,7 +71,7 @@
     <summary>
       <span class="feature-icon" aria-hidden="true"><span></span><span></span><span></span></span>
       <span class="feature-main"><span class="feature-heading">관련자 합산 그룹</span><span class="identifiers">{{ group.members|join(' · ') }}</span></span>
-      <span class="feature-total"><span>{% if group.pending_amount %}접수 후 예상 누계{% else %}그룹 월 누계{% endif %}</span><strong>{{ money(group.projected_total) }}<small>원</small></strong></span>
+      <span class="feature-total"><span>{% if group.disputed_range %}그룹 월 누계 후보{% elif group.pending_amount %}접수 후 예상 누계{% else %}그룹 월 누계{% endif %}</span><strong>{{ monthly_amount(group.projected_total, group.disputed_range) }}<small>원</small></strong></span>
       {{ path_tag(group.authority) }}
       <span class="feature-toggle">판정 근거 <i class="chevron"></i></span>
     </summary>
@@ -79,8 +79,7 @@
       <div><h3>직접 연결 근거</h3>
       <ul class="edges">{% for edge in group.edges %}<li><b>{{ edge.left }} ↔ {{ edge.right }}</b> {{ edge['keys']|join(' · ') }} 일치</li>{% endfor %}</ul>{{ links(group.group_id) }}</div>
       <div><h3>월 누계 구성</h3>{{ breakdown(group) }}
-      <p class="applied">현재 반영된 누계 <strong>{{ money(group.total) }}원</strong></p>
-      {% if group.disputed_range %}<p>입력 후보에 따른 월 누계 범위 {{ money(group.disputed_range[0]) }}원 ~ {{ money(group.disputed_range[1]) }}원</p>{% endif %}</div>
+      <p class="applied">현재 반영된 누계 <strong>{{ money(group.total) }}원</strong></p></div>
     </div>
   </details>
   {% endfor %}
@@ -153,7 +152,7 @@
           <tr>
             <th scope="row"><span class="agency-name">{{ row.agency_name }}</span><small class="agency-id">{{ row.agency_id }}</small></th>
             <td class="code">{{ row.rebate_id }}</td><td class="numeric number">{{ money(row.amount) }}</td>
-            <td class="numeric number">{{ money(row.group_total) }}</td><td>{{ path_tag(row.authority) }}</td>
+            <td class="numeric number">{{ monthly_amount(row.group_total, group.disputed_range if group else none) }}{% if group and group.disputed_range %}원{% endif %}</td><td>{{ path_tag(row.authority) }}</td>
             <td><span class="state{% if row.state == '접수 완료' %} received{% endif %}">{{ row.state }}</span>{% if row.needs_check and row.state != '확인 필요' %}<span class="check-note">확인 필요</span>{% endif %}</td>
             <td class="detail-cell"><button type="button" class="row-toggle js-only" aria-expanded="false" aria-controls="line-{{ loop.index }}" aria-label="{{ row.agency_id }} {{ row.rebate_id }} 상세"><i class="chevron"></i></button></td>
           </tr>

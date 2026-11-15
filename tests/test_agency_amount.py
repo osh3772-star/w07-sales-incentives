@@ -1,13 +1,17 @@
 import csv
 import json
 from contextlib import closing
+from html.parser import HTMLParser
+from unittest.mock import Mock
 
 import funding
+from ai_drafts import generate_draft
 from amount_reviews import has_open_issue
 from approvals import decide_approval, submit_approval
 from payments import confirm_account, record_reply
 from rules import month_overview
 from store import open_db
+from test_ai_drafts import mock_writer
 from test_amount_reviews import AmountReviewFixture, CASH, LEAD, STAFF
 from test_intake import running_server
 from test_workflow_http import Session
@@ -19,7 +23,102 @@ REVIEW = "/intake/TH-X/resolve-amount"
 OLD_ACCOUNT, NEW_ACCOUNT = "시험은행 700-011", "시험은행 700-037"
 
 
-class AgencyAmountTests(AmountReviewFixture):
+class PageText(HTMLParser):
+    def __init__(self, html):
+        super().__init__()
+        self.parts = []
+        self.feed(html)
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def text(self):
+        return " ".join("".join(self.parts).split())
+
+
+class AgencyLedgerFixture(AmountReviewFixture):
+    def append(self, rid, agency, month, amount):
+        with self.ledger.open("a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle, delimiter="|", lineterminator="\n").writerow(
+                [rid, agency, month, 5_000_000, amount, "미지급", "NONE", "NONE"]
+            )
+
+
+class BeforeFirstApprovalTests(AgencyLedgerFixture):
+    def receive_conflict(self, original, alternative):
+        self.append("RAW-X", "D-011", JULY, original)
+        self.append("RAW-Y", "D-024", JULY, 775_000)
+        self.post(STAFF, "/intake", 200, month=JULY)
+        self.append("RAW-X", "D-037", JULY, alternative)
+        for _ in range(2):
+            self.post(STAFF, "/intake", 200, month=JULY)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM rebates WHERE period_ym=?", (JULY,)).fetchone()[0], 2)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM open_intake_issues WHERE rebate_id='RAW-X'").fetchone()[0], 1)
+
+    def assert_candidate_range(self, low, high, authority):
+        query = f"?month={JULY}&group=D-011"
+        bounds = f"{low:,}원 ~ {high:,}원"
+        intake = PageText(self.client.get("/" + query).text).text()
+        self.assertIn(bounds, intake)
+        self.assertIn(authority, intake.split(bounds, 1)[1].split("판정 근거", 1)[0])
+        approval = PageText(self.client.get("/approvals" + query).text).text()
+        self.assertIn(bounds, approval)
+        self.assertIn(f"승인권자 {authority}", approval)
+
+        writer = Mock(wraps=mock_writer)
+        draft_id = generate_draft(self.db, STAFF, JULY, "D-011", "proposal", provider=writer)
+        kind, evidence = writer.call_args.args
+        self.assertEqual(kind, "proposal")
+        self.assertEqual(evidence["unresolved_monthly_range_krw"], [low, high])
+        self.assertEqual(evidence["authority"], authority)
+        self.assertIsNone(evidence["monthly_total_krw"])
+        self.assertIsNone(evidence["new_amount_krw"])
+        self.assertEqual(evidence["booked_monthly_total_krw"], 775_000)
+        self.assertCountEqual([line["rebate_id"] for line in evidence["lines"]], ["RAW-X", "RAW-Y"])
+
+        self.post(STAFF, "/approvals/submit", 400, month=JULY, group="D-011", note="미해결 후보 상신 시도")
+        self.post(STAFF, f"/approvals/ai/{draft_id}/adopt", 400, month=JULY,
+                  group="D-011", edited_text="미확정 후보로 결재안 상신 시도")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM approvals").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM payment_instructions").fetchone()[0], 0)
+        response = self.post(CASH, "/payments/1/send", 400, month=JULY)
+        self.assertIn("지급지시를 찾을 수 없습니다", response)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM mock_payment_attempts").fetchone()[0], 0)
+
+    def test_crossing_limit_waits_until_original_is_confirmed_and_submitted(self):
+        self.receive_conflict(1_300_001, 1_150_000)
+        self.assert_candidate_range(1_925_000, 2_075_001, "확정 대기")
+        query = f"?month={JULY}&group=D-011"
+        for _ in range(2):
+            with running_server(self.path) as url:
+                session = Session(url)
+                for path in ("/", "/approvals"):
+                    status, html = session.get(path + query)
+                    self.assertEqual(status, 200)
+                    page = PageText(html).text()
+                    self.assertIn("1,925,000원 ~ 2,075,001원", page)
+                    self.assertIn("승인권자 확정 대기", page)
+                self.assertEqual(session.post("/approvals/submit", month=JULY, group="D-011", note="후보 대기")[0], 400)
+        self.post(STAFF, "/intake/RAW-X/resolve-amount", 200, month=JULY, confirmed_agency_id="D-011",
+                  amount=1_300_001, reason="최초 정산서의 귀속과 금액을 대조", expected_input=1)
+        self.post(STAFF, "/approvals/submit", 200, month=JULY, group="D-011", note="확정한 원본 상신")
+        doc = self.db.execute("SELECT * FROM approvals").fetchone()
+        self.assertEqual((doc["authority"], doc["monthly_total"], doc["new_amount"], doc["status"]),
+                         ("영업임원", 2_075_001, 2_075_001, "승인 대기"))
+        self.assertCountEqual([(r["rebate_id"], r["agency_id"], r["amount"]) for r in json.loads(doc["snapshot"])["lines"]],
+                              [("RAW-X", "D-011", 1_300_001), ("RAW-Y", "D-024", 775_000)])
+        self.post(LEAD, f"/approvals/{doc['approval_id']}/decide", 403, month=JULY, action="approve", reason="권한 확인")
+
+    def test_candidates_up_to_two_million_show_team_and_remain_blocked(self):
+        self.receive_conflict(1_225_000, 1_150_000)
+        self.assert_candidate_range(1_925_000, 2_000_000, "영업지원팀")
+
+    def test_candidates_above_two_million_show_executive_and_remain_blocked(self):
+        self.receive_conflict(1_300_001, 1_225_001)
+        self.assert_candidate_range(2_000_001, 2_075_001, "영업임원")
+
+
+class AgencyAmountTests(AgencyLedgerFixture):
     def setUp(self):
         super().setUp()
         self.append("TH-X", "D-011", JULY, 1_150_000)
@@ -45,12 +144,6 @@ class AgencyAmountTests(AmountReviewFixture):
             "SELECT * FROM approvals WHERE period_ym=? AND group_id='D-011'", (JULY,),
         ).fetchone()
         self.assertEqual((self.initial["decided_by"], self.initial["monthly_total"]), ("lead", 1_925_000))
-
-    def append(self, rid, agency, month, amount):
-        with self.ledger.open("a", encoding="utf-8", newline="") as handle:
-            csv.writer(handle, delimiter="|", lineterminator="\n").writerow(
-                [rid, agency, month, 5_000_000, amount, "미지급", "NONE", "NONE"]
-            )
 
     def dispute(self):
         self.append("TH-X", "D-037", JULY, 1_350_000)

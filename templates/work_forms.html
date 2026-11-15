@@ -1,4 +1,7 @@
 {% macro money(value) -%}{{ '{:,}'.format(value) }}{%- endmacro %}
+{% macro monthly_amount(total, bounds=none) -%}
+  {%- if bounds %}{{ money(bounds[0]) }}원 ~ {{ money(bounds[1]) }}{% else %}{{ money(total) }}{% endif -%}
+{%- endmacro %}
 {% macro period(value) -%}{{ value[:4] }}년 {{ value[5:]|int }}월{%- endmacro %}
 {% macro fields() -%}
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -31,10 +34,10 @@
 {% macro time(value) -%}
   {% if value %}<time datetime="{{ value }}">{{ value[:19]|replace('T',' ') }} UTC</time>{% endif %}
 {%- endmacro %}
-{% macro amount_pair(total, requested) -%}
+{% macro amount_pair(total, requested, bounds=none) -%}
 <dl class="amount-pair">
-  <div><dt>그룹 월 누계</dt><dd>{{ money(total) }}<small>원</small></dd></div>
-  <div><dt>이번 신규 승인 요청액</dt><dd>{{ money(requested) }}<small>원</small></dd></div>
+  <div><dt>그룹 월 누계{% if bounds %} 후보{% endif %}</dt><dd>{{ monthly_amount(total, bounds) }}<small>원</small></dd></div>
+  <div><dt>이번 신규 승인 요청액</dt><dd>{% if requested is none %}확정 대기{% else %}{{ money(requested) }}<small>원</small>{% endif %}</dd></div>
 </dl>
 {%- endmacro %}
 {% macro links(gid) -%}

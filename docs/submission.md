@@ -1,6 +1,64 @@
 # 김상혁 · W07 판매장려금 제출 설명서
 
-**Corevia 월 판매장려금 심사·지급**은 영업지원이 관련 대리점을 합산해 결재를 받고, 회계가 지급일에 실제로 쓸 수 있는 금액을 기준으로 배정한 뒤 은행 결과를 대사하는 로컬 웹 앱이다. 시연은 2026년 6월 장려금과 7월 지급계획을 사용한다. **처음 보는 심사위원은 아래 설치 명령으로 앱을 열고 [세 가지 시연 순서](demo.md)를 따라가면 된다.**
+## 심사위원 빠른 시작 · 설치부터 실제 AI 채택까지
+
+**첫 시연에서는 회계 담당자가 888,097원 부족한 지급계획을 엽니다.** AI에 해결안을 요청하고 하나를 채택한 뒤, 영업지원과 회계에 어떤 작업이 생기는지 같은 화면에서 확인합니다.
+
+### 1. 압축을 풀고 앱을 설치합니다
+
+Windows PC에 Python 3.13(Python 런처 `py` 포함)과 Node.js(npm 포함)를 준비합니다. `김상혁_W07.zip`을 쓰기 가능한 폴더에 **모두 풀고**, `app.py`와 `requirements.txt`가 보이는 폴더의 탐색기 주소창에 `powershell`을 입력한 뒤 Enter를 누릅니다. 열린 창에서 아래 명령을 실행합니다. 설치와 AI 호출에는 인터넷 연결이 필요합니다. [Python 다운로드](https://www.python.org/downloads/windows/) · [Node.js 다운로드](https://nodejs.org/en/download)
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm.cmd install -g @openai/codex@0.168.0
+```
+
+### 2. 심사위원 계정으로 AI에 로그인합니다
+
+같은 PowerShell에서 다음 명령을 실행하고, 열리는 브라우저에서 **본인의 Codex 모델 사용 권한이 있는 ChatGPT 계정**으로 로그인합니다. 브라우저에서 완료하면 PowerShell로 돌아와 마지막 줄의 로그인 상태를 확인합니다. 이미 이 Windows 사용자로 로그인했다면 상태 확인만 하면 됩니다. 앱은 이 로그인을 사용하며, 웹 화면의 **담당자 선택**은 시연할 업무 역할을 바꾸는 메뉴입니다. [OpenAI 공식 인증 안내](https://developers.openai.com/codex/auth/)
+
+```powershell
+codex.cmd login
+codex.cmd login status
+```
+
+### 3. 지급계획을 열고 새 AI 응답을 받습니다
+
+같은 창에 아래 명령을 붙여넣습니다. 첫 실행은 시연 시작본을 `run` 폴더에 복사하고, 다음 실행은 그 사본에서 이어집니다. 서버가 실행되는 동안 PowerShell 창을 열어 둡니다.
+
+```powershell
+New-Item -ItemType Directory -Force .\run | Out-Null
+if (-not (Test-Path .\run\judge-plan.sqlite3)) {
+    Copy-Item .\demo-data\funding-start.sqlite3 .\run\judge-plan.sqlite3
+}
+.\.venv\Scripts\python.exe -B app.py --funding-db .\run\judge-plan.sqlite3 --port 5074
+```
+
+1. 브라우저에서 [지급계획 화면](http://127.0.0.1:5074/payments/plan?month=2026-06)을 열고 상단 **담당자 선택 → 회계·자금**을 고릅니다. 확인 잔액은 **3,000,000원**이며 이 중 **2,562,561원**이 이미 배정돼 있습니다. 7월 10일 지급예정액 **3,888,097원**에 대한 누적 부족액은 **888,097원**입니다.
+2. **부족액 대응안과 부서 작업 → AI 대안 요청**에서 미배정 지시 **D-037**, 추가 확보 목표액 **900000**, 조정 후보일 **2026-07-13**을 입력하고 **AI 대안 생성**을 누릅니다. 이때 앱이 모델을 호출합니다.
+3. 응답이 도착하면 새 대안에 **선택 대기**가 표시됩니다. **추가 자금 확보**와 **지급일 조정** 두 제안을 읽고, **모델 호출 기록**을 펼쳐 이번 호출 ID를 확인합니다.
+
+### 4. 대안을 채택하고 부서 작업을 확인합니다
+
+**추가 자금 확보** 아래 **담당자 검토·수정 내용**에 `90만원 회수 일정을 확인하고 입금 증빙을 대조한다.`를 입력하고 **추가 자금 확보안 채택**을 누릅니다. 같은 대안에 **입금 확인 대기**, 담당자 의견, 영업지원의 **추가 자금 회수 일정 확인**과 회계의 **실입금 대사**가 표시됩니다. 채택 직후 부족액은 **888,097원**입니다. 시연 입금을 확인해야 잔액이 바뀝니다.
+
+**지급일 조정안 채택**을 선택하면 영업지원의 **대리점 지급일 협의**와 회계의 **변경 예정일 확정** 작업이 생깁니다. 두 선택을 모두 시연하려면 시작본을 각각 새 이름으로 복사해 한 사본에서 한 대안씩 채택합니다. [부분 입금과 지급일 변경 후 확인할 값](demo.md#2-조건-변경--같은-부족액에-다른-계획)
+
+### 소명 질문·근거 요약·결재안도 직접 생성하려면
+
+서버를 실행한 PowerShell에서 `Ctrl+C`를 누른 뒤 아래 명령을 실행합니다. 처음에는 `judge-intake.sqlite3`가 없는 상태로 시작합니다. 새 서버가 뜨면 브라우저에서 [6월 월 정산 접수 화면](http://127.0.0.1:5074/?month=2026-06)을 엽니다.
+
+```powershell
+.\.venv\Scripts\python.exe -B app.py --funding-db .\run\judge-intake.sqlite3 --port 5074
+```
+
+1. **영업지원 담당자**로 2026년 6월 **월 정산 접수**를 누릅니다. 미지급 **40건·37,159,812원**을 접수한 뒤 **관련자·소명**에서 **D-011 · D-024 · D-037** 그룹을 선택하고 **조회**를 누릅니다.
+2. **질문할 정산건**에서 **D-024 · RB-00120**을 골라 **소명 질문 생성**을 누릅니다. 원문을 읽고 문구를 수정한 뒤 **결재 전 해소가 필요한 필수 소명**을 체크하고 **채택하고 소명 요청 기록**을 누릅니다. 생성된 소명에서 회신 주체 `D-024 시연 담당자`, 답변 `공동 수금 약정 계좌를 사용했습니다.`, 증빙 `DEMO-024`를 입력해 **답변 기록**을 누릅니다. 검토 결과를 적고 **소명 해소**를 누릅니다.
+3. 같은 그룹에서 **근거 요약 생성**을 누릅니다. 접수 금액과 방금 기록한 답변을 대조하고 필요한 문구를 수정한 뒤 **그룹 검토 메모에 채택**합니다. 저장된 초안에서 **AI 생성 원문**과 **채택한 내용**을 다시 볼 수 있습니다.
+4. **그룹 결재**에서 같은 그룹의 **결재안 초안 생성**을 누릅니다. 그룹 월 누계와 이번 신규 승인 요청액이 각각 **3,888,097원**인지 검토하고 **채택하고 결재 상신**을 누릅니다. 이때 상태는 **승인 대기**입니다. 상단에서 **영업임원**으로 바꿔 결정 사유를 적고 **승인**하면 대리점별 지급지시 3건이 생깁니다.
+
+검증에 사용한 모델은 `gpt-6.1-sol`입니다. 호출 오류가 나면 화면의 오류와 같은 Windows 사용자의 `codex.cmd login status`, 네트워크, 모델 사용 권한과 잔여 한도를 확인합니다. 계정에서 다른 모델을 사용해야 하면 해당 모델 ID를 PowerShell 환경변수 `W07_AI_MODEL`에 지정하고 서버를 다시 시작합니다. 실행 파일을 찾지 못하면 `W07_CODEX_BINARY`에 설치된 네이티브 `codex.exe`의 절대 경로를 지정합니다. [실제 AI 4종의 호출·채택 검증 기록](e2e-verification.md#2026-11-14-실제-앱-환경의-ai-호출-및-채택)
 
 ## 제출 규격과 첨부 위치
 
@@ -14,59 +72,28 @@
 | 지원 정보 | W07 선택, 신청 시 제출한 포트폴리오(필수 링크 또는 파일)와 결과물 공개 동의를 본인이 확인한다. 이력서는 선택이다. |
 | AI 활용 기록·실행 안내 | AI 활용 기록은 선택이며 미제출 시 AI 활용 과정은 채점에서 제외된다. Codex 자동 수집 현황과 누락분을 본인이 확인한다. 심사위원 실행 안내는 선택, 최대 2,000자다. 아래에 붙여넣을 문안이 있다. |
 
-## 다른 Windows PC에서 실행
+## 시연 데이터와 추가 실행 방법
 
-Windows x64의 Python **3.13.17**, SQLite **3.50.4**(Python 내장), Flask **3.1.3**에서 검증했다. ZIP을 예를 들어 `C:\W07`에 모두 풀고 **app.py가 보이는 폴더**에서 PowerShell을 연다. Python 3.13과 Python 런처(`py`)가 설치돼 있어야 한다. 첫 설치는 패키지 다운로드에 네트워크가 필요하다.
-
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-New-Item -ItemType Directory -Force .\run | Out-Null
-Copy-Item .\demo-data\funding-start.sqlite3 .\run\plan-01.sqlite3
-.\.venv\Scripts\python.exe -B app.py --funding-db .\run\plan-01.sqlite3 --port 5074
-```
-
-브라우저에서 [지급계획 시작 화면](http://127.0.0.1:5074/payments/plan?month=2026-06)을 연다. 최초 확인 잔액 **300만원**, 7월 10일 **누적 부족액 888,097원**이 보인다. 상단 **담당자 선택**에서 회계·자금으로 바꾸면 배정과 입금 확인을 실행할 수 있다. 각 담당자의 시연 계정은 드롭다운으로 전환하며 비밀번호 입력이 없다. 이 주소는 실행한 PC에서 접속한다.
+Windows x64의 Python **3.13.17**, SQLite **3.50.4**(Python 내장), Flask **3.1.3**에서 검증했다. ZIP의 시연 DB는 `demo-data/` 안의 지급계획 시작본과 통합 시연본 두 개다. 검증 DB는 개발 PC에 보관한다.
 
 배포 자료는 원래 폴더 구조로 동봉했다. 앱이 읽는 파일은 `01_참가자_배포용/04_원본데이터/01_corevia/` 안의 대리점 마스터(`master/m_agency_cv.csv`), 장려금 지급표(`sales/sales_rebate_payment_cv.csv`), 회수 이력(`financials/fin_collection_history_cv.csv`)이다. 승인·계좌확인·자금계획·모의 은행 결과는 실행할 때 지정한 SQLite 작업 사본에 저장된다.
 
 | 보고 싶은 상태 | 시작할 데이터와 방법 |
 |---|---|
-| 빈 상태부터 접수·소명·결재 | 실행 중인 서버를 `Ctrl+C`로 종료한 뒤 아래 첫 명령을 실행한다. 기존에 없는 DB 경로에서 시작하면 원본 CSV 3개를 읽어 업무 테이블을 초기화한다. 브라우저에서 월 정산 접수로 이동해 6월을 접수한다. |
+| 빈 상태부터 접수·소명·결재 | 위의 ‘소명 질문·근거 요약·결재안도 직접 생성하려면’ 절차를 따른다. 기존에 없는 DB 경로를 지정하면 앱이 원본 CSV 3개를 읽어 업무 테이블을 초기화한다. |
 | 조건 변경을 반복 | 서버를 종료하고 `funding-start.sqlite3`를 **새 이름**으로 복사한 뒤 그 복사본을 `--funding-db`에 지정한다. 실행 중인 파일을 덮어쓰면 안 된다. 같은 경로를 다시 열면 저장한 상태에서 이어진다. |
-| 최종 흐름 한눈에 보기 | [final-web.sqlite3](../demo-data/final-web.sqlite3)를 복사해 두 번째 명령처럼 실행한다. 결재 #3, 지급지시·대사, 지급계획에서 실제 AI 채택, 부분 입금, 미회신 및 재승인 이력을 읽을 수 있다. |
-| 한 가지 결과를 따로 보기 | `instance/w07-funding-deposit-20261114.sqlite3`는 90만원 입금, `w07-funding-defer-20261114.sqlite3`는 추가 입금 없는 일정 연기다. 두 파일은 복사 후 `--funding-db`로 연다. `instance/w07-e2e-20261113.sqlite3`와 `w07-e2e-all-held-20261113.sqlite3`는 기본 업무 DB다. 복사 후 아래 세 번째 실행 예를 사용한다. [DB별 관찰값](e2e-verification.md) |
+| 최종 흐름 한눈에 보기 | [final-web.sqlite3](../demo-data/final-web.sqlite3)를 아래처럼 복사해 실행한다. 결재 #3, 지급지시·대사, 지급계획에서 과거 실제 AI 채택, 부분 입금, 미회신 및 재승인 이력을 읽을 수 있다. |
+| 자금 확보와 지급일 조정 비교 | 지급계획 시작본을 두 벌 복사해 [조건 변경 시연](demo.md#2-조건-변경--같은-부족액에-다른-계획)의 두 경로를 각각 실행한다. |
 
 ```powershell
-# 예 1 · 새 지급계획 DB에서 최초 접수
-.\.venv\Scripts\python.exe -B app.py --funding-db .\run\empty-01.sqlite3 --port 5074
-
-# 예 2 · Ctrl+C 후 최종 통합 기록 열기
-Copy-Item .\demo-data\final-web.sqlite3 .\run\final-01.sqlite3
+# Ctrl+C로 서버를 종료한 뒤 최종 통합 기록 열기
+if (-not (Test-Path .\run\final-01.sqlite3)) {
+    Copy-Item .\demo-data\final-web.sqlite3 .\run\final-01.sqlite3
+}
 .\.venv\Scripts\python.exe -B app.py --funding-db .\run\final-01.sqlite3 --port 5074
-
-# 예 3 · Ctrl+C 후 지급계획 도입 전 기본 업무 기록 열기
-Copy-Item .\instance\w07-e2e-20261113.sqlite3 .\run\e2e-01.sqlite3
-$env:W07_DATABASE = (Resolve-Path .\run\e2e-01.sqlite3).Path
-.\.venv\Scripts\python.exe -B app.py --port 5074
 ```
 
 각 예는 한 번에 하나씩 실행한다. 5074가 사용 중이면 빈 포트로 바꾸고 브라우저 주소에도 같은 번호를 쓴다. 기존 개발 문서의 5070~5073은 작성 당시 검증 PC의 포트다. 자동 검증은 `.\.venv\Scripts\python.exe -B -m unittest discover -s tests`로 실행한다. 기본 실행은 실제 모델이 필요한 두 테스트를 건너뛴다. AI를 설정한 다음 같은 PowerShell에서 `$env:W07_TEST_LIVE_AI='1'`을 지정하고 다시 실행하면 이 두 테스트도 호출한다.
-
-### 실제 AI를 새로 호출할 때
-
-이 앱은 Flask 서버를 시작한 **같은 OS 사용자**의 OpenAI Codex CLI 로그인을 사용한다. 검증 환경은 Windows 네이티브 CLI **0.168.0**, 모델 **gpt-6.1-sol**이다. 네트워크와 모델 사용 권한·잔여 한도가 필요하다. Node.js와 npm을 설치한 뒤 PowerShell에서 다음을 실행하고 브라우저 로그인 절차를 완료한다. [OpenAI 공식 Codex CLI 설명](https://developers.openai.com/codex/cli/) · [공식 인증 안내](https://developers.openai.com/codex/auth/)
-
-```powershell
-npm.cmd install -g @openai/codex@0.168.0
-codex.cmd --version
-codex.cmd login
-codex.cmd login status
-```
-
-앱은 npm 배포판의 네이티브 `codex.exe`를 찾는다. 자동 탐색이 실패하면 실제 설치된 `codex.exe`의 절대 경로를 `$env:W07_CODEX_BINARY`로 지정한다. 계정이 기본 모델을 사용할 수 없을 때는 해당 계정이 쓸 수 있는 모델 ID를 `$env:W07_AI_MODEL`에 지정하고 **같은 PowerShell에서 서버를 재시작**한다. `.env.example`은 변수 이름 목록이다. 이 앱은 PowerShell의 환경변수를 읽는다.
-
-영업지원의 **관련자·소명 → 근거 요약 생성** 또는 회계·자금의 **지급계획 → AI 대안 생성**으로 새 호출을 시험한다. 화면에 새 원문·제공자·모델·호출 ID가 남고, 실제 업무 반영은 담당자가 검토 후 채택할 때 일어난다. 호출 실패는 화면의 오류로 표시된다. 로그인 없이도 계산·수동 결재·모의 대사와 동봉된 과거 호출 기록 열람은 가능하다. 참가자의 인증정보는 제출물에 들어 있지 않다.
 
 ## 설계 설명에 사용할 답변 재료
 

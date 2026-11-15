@@ -30,7 +30,7 @@
 <section class="work-card">
   <div class="work-heading"><div><h2>월 누계와 승인 요청액</h2><p class="identifiers">{{ chosen.members|join(' · ') }}</p></div>
     <a class="work-link" href="{{ url_for('cases', month=month, group=selected_group) }}">관련자·소명 보기 →</a></div>
-  {{ amount_pair(chosen.total, chosen.review_amount) }}
+  {{ amount_pair(chosen.total, none if chosen.new_amount_unresolved else chosen.review_amount, chosen.disputed_range) }}
   {% if chosen.disputed_range %}<p class="attention">{{ overview.dispute_reasons[chosen.group_id] }} 승인권자 {{ chosen.authority }}</p>{% endif %}
   {% if reapprovals %}<p class="attention">근거 변경 후 재승인 대상 {{ reapproval_lines|length }}건 · <b>{{ money(reapproval_lines|sum(attribute='rebate_amount_krw')) }}원</b> · {{ chosen.authority }} 재상신</p>
   <p class="item-meta">{% for task in reapproval_lines %}{{ task.rebate_id }}{% if task.instruction_id %} · 기존 지급지시 #{{ task.instruction_id }}{% endif %}{% if not loop.last %} / {% endif %}{% endfor %}</p>{% endif %}
@@ -44,7 +44,7 @@
     {{ fields() }}<label>상신 사유<textarea name="note" rows="2" required></textarea></label>
     <button class="primary">{{ chosen.authority ~ ' 재상신' if reapprovals else '그룹 결재 상신' }}</button>
   </form>
-  {% elif not history and not blockers and not review and not reapprovals %}
+  {% elif not history and not blockers and not review and not reapprovals and not chosen.disputed_range %}
   <p class="next-action">접수된 신규 심사 건이 없습니다. <a href="{{ url_for('index', month=month) }}">월 정산 접수 보기</a></p>
   {% endif %}
 </section>

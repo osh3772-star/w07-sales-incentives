@@ -126,6 +126,10 @@ def _scope(db, month, group_id, kind, rebate_id, previous_id):
         "review_memos": [{"id": m["draft_id"], "text": mask(m["text"])} for m in memos],
     }
     if "disputed_range" in group:
+        context["booked_monthly_total_krw"] = group["total"]
+        context["monthly_total_krw"] = None
+        if group["new_amount_unresolved"]:
+            context["new_amount_krw"] = None
         context["unresolved_monthly_range_krw"] = list(group["disputed_range"])
         context["authority"] = group["authority"]
     notices = _applicable_corrections(db, month, group["members"])

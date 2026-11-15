@@ -68,7 +68,7 @@ def open_db(db_path):
     try:
         db.execute("PRAGMA foreign_keys = ON")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 8:
+        if version > 9:
             raise ValueError("더 최신 버전의 업무 DB입니다. 앱 버전을 확인하세요.")
         if version == 0:
             db.executescript(SCHEMA)
@@ -113,6 +113,13 @@ def open_db(db_path):
                                       WHERE i.instruction_id=mock_payment_attempts.instruction_id)
                                   WHERE payee_agency_id IS NULL""")
                     db.execute("PRAGMA user_version = 8")
+        if version < 9:
+            from payments import migrate_completed_discrepancies
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("PRAGMA user_version").fetchone()[0] < 9:
+                    migrate_completed_discrepancies(db)
+                    db.execute("PRAGMA user_version = 9")
     except Exception:
         db.close()
         raise
